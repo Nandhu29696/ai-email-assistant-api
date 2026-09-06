@@ -1,0 +1,6 @@
+uvicorn app.main:app --port 8000 --reload
+
+# Run this separately when mailbox polling is needed:
+# python -m app.worker
+
+API doc: http://localhost:8000/docs#/
