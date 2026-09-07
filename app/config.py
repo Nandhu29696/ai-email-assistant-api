@@ -80,14 +80,14 @@ class Settings(BaseSettings):
     # ── Gmail OAuth ───────────────────────────────────────────
     GMAIL_CLIENT_ID: str = ""
     GMAIL_CLIENT_SECRET: str = ""
-    GMAIL_REDIRECT_URI: str = "http://localhost:8000/api/integrations/gmail/callback"
+    GMAIL_REDIRECT_URI: str = "http://187.127.166.46:5000/api/integrations/gmail/callback"
     GMAIL_WEBHOOK_SECRET: str = ""
 
     # ── Outlook OAuth ─────────────────────────────────────────
     OUTLOOK_CLIENT_ID: str = ""
     OUTLOOK_CLIENT_SECRET: str = ""
     OUTLOOK_TENANT_ID: str = "common"
-    OUTLOOK_REDIRECT_URI: str = "http://localhost:8000/api/integrations/outlook/callback"
+    OUTLOOK_REDIRECT_URI: str = "http://187.127.166.46:5000/api/integrations/outlook/callback"
     OUTLOOK_WEBHOOK_URL: str = ""
     OUTLOOK_WEBHOOK_CLIENT_STATE: str = ""
 
