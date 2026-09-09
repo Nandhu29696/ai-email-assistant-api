@@ -17,7 +17,8 @@ class Settings(BaseSettings):
         "http://localhost:3001",
         "http://127.0.0.1:3000",
         "http://127.0.0.1:3001",
-        "http://187.127.166.46:3000"
+        "http://187.127.166.46:3000",
+        "https://187.127.166.46"
     ]
 
     # ── Database – individual fields (read from .env) ─────────
