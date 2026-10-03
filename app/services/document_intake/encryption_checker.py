@@ -20,11 +20,19 @@ def _check_pdf(data: bytes) -> EncryptionCheckResult:
         from pypdf import PdfReader
         reader = PdfReader(io.BytesIO(data))
         if reader.is_encrypted:
+            # Owner-password-only PDFs (print/copy restrictions) open with an
+            # empty user password and can be processed normally.
+            try:
+                if reader.decrypt(""):
+                    return EncryptionCheckResult(is_encrypted=False, reason="OK (permission-restricted PDF)")
+            except Exception:
+                pass
             return EncryptionCheckResult(is_encrypted=True, reason="PDF is password-protected/encrypted")
         return EncryptionCheckResult(is_encrypted=False, reason="OK")
     except Exception as exc:
-        logger.warning(f"[encryption_checker] PDF check failed, treating as unreadable: {exc}")
-        return EncryptionCheckResult(is_encrypted=True, reason=f"Unable to read PDF structure: {exc}")
+        # A corrupt PDF is not an encrypted one; let conversion report it as a failure.
+        logger.warning(f"[encryption_checker] PDF structure unreadable: {exc}")
+        return EncryptionCheckResult(is_encrypted=False, reason=f"Unreadable PDF: {exc}")
 
 
 def _check_office_doc(data: bytes) -> EncryptionCheckResult:

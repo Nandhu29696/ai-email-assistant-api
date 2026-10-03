@@ -1,7 +1,8 @@
-from sqlalchemy import Column, String, Boolean, DateTime, Integer, ForeignKey, Text, JSON
+from sqlalchemy import Column, String, Boolean, Integer, BigInteger, ForeignKey, Text, JSON
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
-from app.database import Base
+import sqlalchemy as sa
+from app.database import Base, UTCDateTime
 
 
 class User(Base):
@@ -12,13 +13,17 @@ class User(Base):
     username            = Column(String(100), unique=True, nullable=False, index=True)
     full_name           = Column(String(255))
     hashed_password     = Column(String(255), nullable=False)
-    role                = Column(String(20), nullable=False, default="employee")
+    role                = Column(String(20), nullable=False, default="client")
     is_active           = Column(Boolean, default=True)
-    last_login_at       = Column(DateTime(timezone=True))
+    last_login_at       = Column(UTCDateTime())
     failed_login_count  = Column(Integer, default=0)
-    locked_until        = Column(DateTime(timezone=True))
-    created_at          = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at          = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    locked_until        = Column(UTCDateTime())
+    mfa_enabled         = Column(Boolean, nullable=False, default=False, server_default=sa.false())
+    mfa_secret          = Column(Text)            # encrypted base32 TOTP secret
+    mfa_recovery_codes  = Column(JSON)            # list of SHA-256 hashes of unused codes
+    mfa_last_used_step  = Column(BigInteger)      # replay protection for TOTP codes
+    created_at          = Column(UTCDateTime(), server_default=func.now())
+    updated_at          = Column(UTCDateTime(), server_default=func.now(), onupdate=func.now())
 
     sessions   = relationship("UserSession", back_populates="user", cascade="all, delete-orphan")
     audit_logs = relationship("AuditLog",    back_populates="user", cascade="all, delete-orphan")
@@ -29,15 +34,15 @@ class UserSession(Base):
     __tablename__ = "user_sessions"
 
     id            = Column(Integer, primary_key=True, autoincrement=True)
-    user_id       = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True, unique=True)
-    refresh_token = Column(String(512), unique=True, nullable=False, index=True)
+    user_id       = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    refresh_token = Column(String(512), unique=True, nullable=False, index=True)  # SHA-256 of the token
     ip_address    = Column(String(45))
     user_agent    = Column(String(512))
     is_active     = Column(Boolean, default=True)
-    expires_at    = Column(DateTime(timezone=True), nullable=False)
-    last_used_at  = Column(DateTime(timezone=True))
-    revoked_at    = Column(DateTime(timezone=True))
-    created_at    = Column(DateTime(timezone=True), server_default=func.now())
+    expires_at    = Column(UTCDateTime(), nullable=False)
+    last_used_at  = Column(UTCDateTime())
+    revoked_at    = Column(UTCDateTime())
+    created_at    = Column(UTCDateTime(), server_default=func.now())
 
     user = relationship("User", back_populates="sessions")
 
@@ -50,9 +55,9 @@ class OAuthState(Base):
     state_hash = Column(String(64), unique=True, nullable=False, index=True)
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
     provider = Column(String(20), nullable=False)
-    expires_at = Column(DateTime(timezone=True), nullable=False, index=True)
-    used_at = Column(DateTime(timezone=True))
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    expires_at = Column(UTCDateTime(), nullable=False, index=True)
+    used_at = Column(UTCDateTime())
+    created_at = Column(UTCDateTime(), server_default=func.now())
 
     user = relationship("User")
 
@@ -70,9 +75,24 @@ class AuditLog(Base):
     user_agent    = Column(String(512))
     status        = Column(String(20), default="success")
     details       = Column(JSON)
-    created_at    = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+    created_at    = Column(UTCDateTime(), server_default=func.now(), index=True)
 
     user = relationship("User", back_populates="audit_logs")
+
+
+class FailedJob(Base):
+    """Dead-letter queue: background jobs that exhausted their retries."""
+    __tablename__ = "failed_jobs"
+
+    id          = Column(Integer, primary_key=True, autoincrement=True)
+    job_name    = Column(String(100), nullable=False, index=True)
+    args_json   = Column(JSON)
+    job_key     = Column(String(255))
+    attempts    = Column(Integer, nullable=False, default=0)
+    error       = Column(Text)
+    status      = Column(String(20), nullable=False, default="failed", index=True)  # failed | retried | discarded
+    created_at  = Column(UTCDateTime(), server_default=func.now(), index=True)
+    resolved_at = Column(UTCDateTime())
 
 
 class ApiRequestLog(Base):
@@ -89,4 +109,4 @@ class ApiRequestLog(Base):
     ip_address       = Column(String(45))
     user_agent       = Column(String(512))
     error_detail     = Column(Text)
-    created_at       = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+    created_at       = Column(UTCDateTime(), server_default=func.now(), index=True)

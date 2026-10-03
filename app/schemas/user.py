@@ -1,4 +1,4 @@
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel
 from typing import Optional
 from datetime import datetime
 
@@ -9,13 +9,19 @@ class UserLogin(BaseModel):
 
 
 class TokenResponse(BaseModel):
-    access_token: str
-    refresh_token: Optional[str] = None   # included on login; omitted on API calls
+    # Tokens are delivered as httpOnly cookies; they appear in the body only
+    # for API clients that send "X-Auth-Mode: token".
+    access_token: Optional[str] = None
+    refresh_token: Optional[str] = None
     token_type: str = "bearer"
     role: str
     username: str
     full_name: Optional[str] = None
     user_id: int
+    mfa_enabled: Optional[bool] = None
+    # Set when a second factor is required: POST /api/auth/mfa/verify
+    mfa_required: Optional[bool] = None
+    mfa_token: Optional[str] = None
 
 
 class UserOut(BaseModel):
@@ -25,6 +31,7 @@ class UserOut(BaseModel):
     full_name: Optional[str]
     role: str
     is_active: bool
+    mfa_enabled: bool = False
     last_login_at: Optional[datetime] = None
     created_at: Optional[datetime] = None
 

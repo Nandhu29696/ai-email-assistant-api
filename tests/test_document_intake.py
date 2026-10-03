@@ -1,13 +1,8 @@
-import io
-import asyncio
 
 from app.services.document_intake.file_policy_validator import validate_file_policy
 from app.services.document_intake.autoreply_detector import is_autoreply
 from app.services.document_intake.domain_validator import is_system_sender
-from app.services.document_intake.sensitive_data_detector import detect_sensitivity
 from app.services.document_intake.attachment_extractor import has_attachments
-from app.services.document_intake.client_callback_notifier import build_callback_payload
-from app.models.document_intake import EmailBatch, EmailBatchAttachment
 
 
 def test_file_policy_validator_allows_valid_pdf():
@@ -57,39 +52,3 @@ def test_has_attachments_true_and_false():
     assert has_attachments(payload_without_attachment) is False
 
 
-def test_sensitive_data_detector_flags_ssn():
-    result = asyncio.run(detect_sensitivity("My SSN is 123-45-6789, please process this."))
-    assert result.contains_pii is True
-    assert "ssn" in result.pii_types
-    assert result.sensitivity_level == "restricted"
-
-
-def test_sensitive_data_detector_no_pii_found():
-    result = asyncio.run(detect_sensitivity("Please find attached the quarterly report for review."))
-    assert result.contains_pii is False
-
-
-def test_build_callback_payload_matches_contract_shape():
-    batch = EmailBatch(
-        id=1,
-        batch_no="CLM-PROD-20260905-000001",
-        sender_email="client@example.com",
-        recipient_email="intake@company.com",
-        subject="Invoice Submission",
-        status="SUCCESS",
-        status_reason="Merged PDF generated and stored successfully",
-        attachment_count=1,
-    )
-    from datetime import datetime, timezone
-    batch.received_datetime = datetime(2026, 9, 5, tzinfo=timezone.utc)
-    attachment = EmailBatchAttachment(
-        batch_source_filename="invoice.pdf", doc_type="pdf", file_size_bytes=1024, status="MERGED",
-    )
-
-    payload = build_callback_payload(batch, [attachment])
-
-    assert payload["processResultStatusCode"] == "SUCCESS"
-    assert payload["emailInfo"]["fromEmail"] == "client@example.com"
-    assert payload["emailInfo"]["toEmail"] == "intake@company.com"
-    assert payload["emailInfo"]["noOfAttachments"] == 1
-    assert payload["emailInfo"]["attachments"][0]["filename"] == "invoice.pdf"

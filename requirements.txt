@@ -58,3 +58,7 @@ websockets==12.0
 python-dotenv==1.0.1
 tenacity==8.3.0
 loguru==0.7.2
+
+# Background jobs & observability
+arq==0.26.1
+prometheus-client==0.20.0

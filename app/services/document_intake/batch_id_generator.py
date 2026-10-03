@@ -8,6 +8,7 @@ unique and gap-free even when multiple pollers run concurrently.
 from __future__ import annotations
 from datetime import datetime, timezone
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from app.models.document_intake import BatchSequence
 
@@ -30,9 +31,13 @@ def generate_batch_no(db: Session, batch_prefix: str, mailbox_type: str) -> str:
         .first()
     )
     if row is None:
-        row = BatchSequence(sequence_key=sequence_key, last_value=0)
-        db.add(row)
-        db.flush()
+        # Two workers may try to create today's counter at once; the loser of
+        # the unique-key race rolls back its savepoint and locks the winner's row.
+        try:
+            with db.begin_nested():
+                db.add(BatchSequence(sequence_key=sequence_key, last_value=0))
+        except IntegrityError:
+            pass
         row = (
             db.query(BatchSequence)
             .filter(BatchSequence.sequence_key == sequence_key)

@@ -1,131 +1,98 @@
 """
-Dashboard router — statistics, trends, and category breakdowns.
+Dashboard — how many emails went through each rule, plus AI category/sentiment
+breakdowns and the health of the automatic pickup.
 """
 from __future__ import annotations
-from datetime import datetime, timedelta
-from fastapi import APIRouter, Depends, Query
-from sqlalchemy.orm import Session
-from sqlalchemy import func, case
 
+from datetime import datetime, timedelta, timezone
+
+from fastapi import APIRouter, Depends, Query
+from sqlalchemy import func
+from sqlalchemy.orm import Session
+
+from app.config import settings
 from app.database import get_db
-from app.models.email import Email, EmailAnalysis, EmailIntegration
-from app.routers.auth import get_current_user
+from app.models.document_intake import EmailBatch
+from app.models.email import AllowedDomain, EmailIntegration
 from app.models.user import User
-from app.schemas.dashboard import (
-    DashboardStats, TrendsResponse, TrendPoint,
-    SentimentBreakdown, PriorityBreakdown, CategoryBreakdown,
-)
+from app.routers.auth import get_current_user
 
 router = APIRouter()
 
+OUTCOMES = [
+    "PROCESSED", "DOMAIN_NOT_ALLOWED", "NO_ATTACHMENT", "INVALID_FILE_TYPE",
+    "INVALID_ATTACHMENTS", "SENDER_NOT_VERIFIED", "AUTOMATED_MESSAGE", "SYSTEM_ERROR",
+]
 
-@router.get("/stats", response_model=DashboardStats)
-def get_stats(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    """Return aggregate dashboard statistics."""
-    owner_id = None if current_user.role == "admin" else current_user.id
 
-    email_query = db.query(
-        func.count(Email.id),
-        func.sum(case((Email.is_read == False, 1), else_=0)),
-        func.sum(case((Email.processed_at.isnot(None), 1), else_=0)),
-    ).join(EmailIntegration, Email.integration_id == EmailIntegration.id)
-    if owner_id is not None:
-        email_query = email_query.filter(EmailIntegration.owner_user_id == owner_id)
-    total, unread, processed = email_query.one()
+def _scoped(query, current_user: User):
+    if current_user.role != "admin":
+        query = query.join(EmailIntegration, EmailBatch.integration_id == EmailIntegration.id).filter(
+            EmailIntegration.owner_user_id == current_user.id
+        )
+    return query
 
-    analysis_query = db.query(
-        func.sum(case((EmailAnalysis.sentiment == "positive", 1), else_=0)),
-        func.sum(case((EmailAnalysis.sentiment == "neutral", 1), else_=0)),
-        func.sum(case((EmailAnalysis.sentiment == "negative", 1), else_=0)),
-        func.sum(case((EmailAnalysis.priority == "critical", 1), else_=0)),
-        func.sum(case((EmailAnalysis.priority == "high", 1), else_=0)),
-        func.sum(case((EmailAnalysis.priority == "medium", 1), else_=0)),
-        func.sum(case((EmailAnalysis.priority == "low", 1), else_=0)),
-        func.sum(case((EmailAnalysis.category == "complaint", 1), else_=0)),
-        func.sum(case((EmailAnalysis.category == "support", 1), else_=0)),
-        func.sum(case((EmailAnalysis.category == "sales", 1), else_=0)),
-        func.sum(case((EmailAnalysis.category == "refund", 1), else_=0)),
-        func.sum(case((EmailAnalysis.category == "invoice", 1), else_=0)),
-        func.sum(case((EmailAnalysis.category == "feedback", 1), else_=0)),
-        func.sum(case((EmailAnalysis.category == "general", 1), else_=0)),
-        func.avg(EmailAnalysis.sentiment_score),
-    ).join(Email, Email.id == EmailAnalysis.email_id).join(
-        EmailIntegration, Email.integration_id == EmailIntegration.id
-    )
-    if owner_id is not None:
-        analysis_query = analysis_query.filter(EmailIntegration.owner_user_id == owner_id)
-    (
-        positive, neutral, negative,
-        critical, high, medium, low,
-        complaint, support, sales, refund, invoice, feedback, general,
-        avg_score,
-    ) = analysis_query.one()
 
-    total = total or 0
-    unread = unread or 0
-    processed = processed or 0
-    avg_score = avg_score or 0.0
+def _counts(db: Session, current_user: User, column, since: datetime) -> dict[str, int]:
+    rows = _scoped(db.query(column, func.count(EmailBatch.id)), current_user).filter(
+        EmailBatch.received_datetime >= since,
+    ).group_by(column).all()
+    return {(key or "unknown"): count for key, count in rows}
 
-    return DashboardStats(
-        total_emails=total,
-        unread_emails=unread,
-        processed_emails=processed,
-        critical_emails=critical or 0,
-        avg_sentiment_score=round(float(avg_score), 4),
-        sentiment=SentimentBreakdown(
-            positive=positive or 0, neutral=neutral or 0, negative=negative or 0,
-        ),
-        priority=PriorityBreakdown(
-            critical=critical or 0, high=high or 0, medium=medium or 0, low=low or 0,
-        ),
-        category=CategoryBreakdown(
-            complaint=complaint or 0, support=support or 0, sales=sales or 0,
-            refund=refund or 0, invoice=invoice or 0, feedback=feedback or 0,
-            general=general or 0,
-        ),
-    )
 
-@router.get("/trends", response_model=TrendsResponse)
-def get_trends(
-    days: int = Query(30, ge=7, le=90),
+@router.get("/summary")
+def summary(
+    days: int = Query(30, ge=1, le=365),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Return daily sentiment trend data for the last N days."""
-    since = datetime.utcnow() - timedelta(days=days)
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+    by_status = _counts(db, current_user, EmailBatch.status, since)
+    by_outcome = _counts(db, current_user, EmailBatch.outcome, since)
 
-    rows = (
-        db.query(
-            func.date(Email.received_at).label("date"),
-            EmailAnalysis.sentiment,
-            func.count(Email.id).label("count"),
-        )
-        .join(EmailAnalysis, Email.id == EmailAnalysis.email_id)
-        .join(EmailIntegration, Email.integration_id == EmailIntegration.id)
-        .filter(Email.received_at >= since)
-        .filter(EmailIntegration.owner_user_id == current_user.id if current_user.role != "admin" else True)
-        .group_by(func.date(Email.received_at), EmailAnalysis.sentiment)
-        .order_by(func.date(Email.received_at))
-        .all()
-    )
+    day = func.date(EmailBatch.received_datetime)
+    daily_rows = _scoped(db.query(day, EmailBatch.status, func.count(EmailBatch.id)), current_user).filter(
+        EmailBatch.received_datetime >= since,
+    ).group_by(day, EmailBatch.status).all()
+    daily: dict[str, dict[str, int]] = {}
+    for date_value, status, count in daily_rows:
+        key = str(date_value)
+        daily.setdefault(key, {"date": key, "SUCCESS": 0, "REJECTED": 0, "FAILED": 0, "OTHER": 0})
+        bucket = status if status in ("SUCCESS", "REJECTED", "FAILED") else "OTHER"
+        daily[key][bucket] += count
 
-    # Aggregate by date
-    date_map: dict[str, dict] = {}
-    for row in rows:
-        d = str(row.date)
-        if d not in date_map:
-            date_map[d] = {"positive": 0, "neutral": 0, "negative": 0}
-        date_map[d][row.sentiment] = row.count
+    mailboxes = db.query(EmailIntegration).filter(EmailIntegration.is_active == True)
+    if current_user.role != "admin":
+        mailboxes = mailboxes.filter(EmailIntegration.owner_user_id == current_user.id)
+    mailboxes = mailboxes.all()
+    domains_configured = db.query(AllowedDomain.id).filter(AllowedDomain.is_active == True).count()
 
-    trends = [
-        TrendPoint(
-            date=d,
-            positive=v["positive"],
-            neutral=v["neutral"],
-            negative=v["negative"],
-            total=v["positive"] + v["neutral"] + v["negative"],
-        )
-        for d, v in sorted(date_map.items())
-    ]
-
-    return TrendsResponse(trends=trends, period_days=days)
+    return {
+        "days": days,
+        "total": sum(by_status.values()),
+        "by_status": by_status,
+        "by_outcome": {key: by_outcome.get(key, 0) for key in OUTCOMES},
+        "by_category": _counts(db, current_user, EmailBatch.email_category, since),
+        "by_sentiment": _counts(db, current_user, EmailBatch.sentiment, since),
+        "by_priority": _counts(db, current_user, EmailBatch.priority, since),
+        "daily": sorted(daily.values(), key=lambda item: item["date"]),
+        "pickup": {
+            "automatic": settings.RUN_BACKGROUND_WORKERS,
+            "interval_seconds": settings.FETCH_INTERVAL_SECONDS,
+            "mailboxes": [
+                {
+                    "id": m.id,
+                    "email_address": m.email_address,
+                    "provider": m.provider,
+                    "health_status": m.health_status or "unknown",
+                    "health_message": m.health_message,
+                    "last_sync_at": m.last_sync_at.isoformat() if m.last_sync_at else None,
+                    "last_email_processed_at": m.last_email_processed_at.isoformat() if m.last_email_processed_at else None,
+                }
+                for m in mailboxes
+            ],
+        },
+        "allowed_domains_configured": domains_configured,
+        "ops_alerts_configured": bool(settings.OPS_ALERT_WEBHOOK_URL),
+        "retention_days_default": settings.DOCUMENT_INTAKE_DEFAULT_RETENTION_DAYS,
+    }

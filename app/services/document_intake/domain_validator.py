@@ -1,7 +1,9 @@
 """
-Domain validator for the document-intake pipeline (§5 step 2).
-Wraps the existing AllowedDomain whitelist; auto-reply sending is handled
-by the caller (pipeline.py) via gmail_send-style helpers.
+Sender-domain allow-list shared by conversation ingestion and document intake (§5 step 2).
+
+A mailbox's own ``allowed_sender_domains`` (comma-separated) takes precedence;
+otherwise the global ``allowed_domains`` table applies. An empty list means
+"allow all".
 """
 from __future__ import annotations
 from dataclasses import dataclass
@@ -32,19 +34,32 @@ def is_system_sender(sender_email: str) -> bool:
     )
 
 
-def validate_domain(db: Session, sender_email: str) -> DomainCheckResult:
-    """
-    Check the sender's domain against the allowed_domains whitelist.
-    An empty whitelist means "allow all" (matches existing gmail_sync behavior).
-    """
-    domain = sender_email.split("@")[-1].lower() if "@" in sender_email else ""
+def parse_domain_list(value: str | None) -> set[str]:
+    return {d.strip().lower().lstrip("@") for d in (value or "").split(",") if d.strip()}
 
-    allowed_domains = {
+
+def allowed_domains_for(db: Session, integration=None) -> set[str]:
+    """Effective allow-list: the mailbox's own list, else the global table."""
+    own = parse_domain_list(getattr(integration, "allowed_sender_domains", None))
+    if own:
+        return own
+    return {
         d.domain.lower().strip()
         for d in db.query(AllowedDomain).filter(AllowedDomain.is_active == True).all()
     }
 
-    if not allowed_domains or domain in allowed_domains:
+
+def domain_matches(domain: str, allowed: set[str]) -> bool:
+    """Exact match, or a subdomain of an allowed domain (mail.example.com ⊂ example.com)."""
+    return any(domain == entry or domain.endswith("." + entry) for entry in allowed)
+
+
+def validate_domain(db: Session, sender_email: str, integration=None) -> DomainCheckResult:
+    """Check the sender's domain against the effective allow-list for ``integration``."""
+    domain = sender_email.split("@")[-1].lower() if "@" in sender_email else ""
+    allowed = allowed_domains_for(db, integration)
+
+    if not allowed or (domain and domain_matches(domain, allowed)):
         return DomainCheckResult(is_allowed=True, domain=domain, reason="Domain permitted")
 
     return DomainCheckResult(

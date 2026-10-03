@@ -1,7 +1,6 @@
 """Shared utility helpers."""
 from __future__ import annotations
 import re
-from datetime import datetime
 
 
 def truncate(text: str, max_chars: int = 200) -> str:

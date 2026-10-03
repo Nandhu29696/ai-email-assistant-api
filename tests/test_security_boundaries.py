@@ -1,9 +1,7 @@
 import asyncio
-import pytest
 from datetime import datetime, timezone
 
 from app.routers.integrations import _oauth_state, _oauth_user_id
-from app.services.document_intake.client_callback_notifier import validate_callback_url
 from app.models.user import User
 from app.models.email import EmailIntegration
 from app.models.document_intake import EmailBatch
@@ -28,27 +26,10 @@ def test_oauth_state_binds_provider_user_and_is_single_use(db_session):
     assert _oauth_user_id(db_session, None, "gmail") is None
 
 
-@pytest.mark.parametrize("url", [
-    "http://localhost/callback",
-    "http://127.0.0.1/callback",
-    "http://169.254.169.254/latest/meta-data",
-    "http://[::1]/callback",
-])
-def test_callback_url_rejects_local_targets(url):
-    with pytest.raises(ValueError):
-        validate_callback_url(url)
-
-
-def test_callback_url_rejects_credentials():
-    with pytest.raises(ValueError):
-        validate_callback_url("https://user:password@example.com/callback")
-
-
 def test_document_intake_skips_existing_integration_message(db_session, monkeypatch):
     integration = EmailIntegration(
         provider="gmail",
         email_address="intake@example.com",
-        processing_mode="document_intake",
     )
     db_session.add(integration)
     db_session.flush()

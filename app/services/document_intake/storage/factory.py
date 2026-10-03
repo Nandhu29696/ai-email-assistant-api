@@ -11,3 +11,12 @@ def get_storage_adapter(provider: str | None = None) -> StorageAdapter:
         from app.services.document_intake.storage.azure_blob import AzureBlobStorageAdapter
         return AzureBlobStorageAdapter()
     return LocalDiskStorageAdapter()
+
+
+def get_adapter_for_path(stored_path: str | None, provider: str | None = None) -> StorageAdapter:
+    """Pick the adapter that wrote ``stored_path`` (the path format identifies it)."""
+    if stored_path and stored_path.startswith("azure://"):
+        return get_storage_adapter("azure_blob")
+    if stored_path:
+        return LocalDiskStorageAdapter()
+    return get_storage_adapter(provider)

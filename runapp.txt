@@ -1,6 +1,28 @@
+# 1. Bring the database up to date (required after each update):
+#    UAT (created outside Alembic):  python -m scripts.sync_schema --apply
+#    Databases managed by Alembic:   alembic upgrade head
+
+# 2. API — this also picks up new mail automatically (RUN_BACKGROUND_WORKERS=true, the default).
 uvicorn app.main:app --port 5000 --reload
 
-# Run this separately when mailbox polling is needed:
+# 3. Frontend (in ../frontend) — after a code change: npx next build, then restart:
+#    npx next start -p 3000
+
+# Optional: dedicated worker instead of the API picking up mail (production with Redis).
+#    Set RUN_BACKGROUND_WORKERS=false for the API first — never run both, or emails are
+#    processed twice.
 # python -m app.worker
+
+# Tests (use a throwaway database — never the one in .env):
+pip install -r requirements-dev.txt
+python -m pytest                                  # quick run on SQLite
+# TEST_DATABASE_URLS="postgresql+psycopg2://u:p@localhost/test_db,mysql+pymysql://u:p@localhost/test_db" python -m pytest
+ruff check .
+
+# Metrics: GET /metrics (Prometheus; set METRICS_TOKEN to require a bearer token)
+# Health:  GET /health (database, Redis, LLM)  ·  GET /health/live (liveness)
+# Logs:    LOG_FORMAT=json for one JSON object per line (includes request_id / job context)
+
+# Production: see ../docker-compose.prod.yml and ../deploy/.env.production.example
 
 API doc: http://187.127.166.46:5000/docs#/

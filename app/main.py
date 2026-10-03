@@ -1,133 +1,69 @@
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
 import asyncio
-from typing import Any, cast
+from typing import Any
 
 from app.config import settings
 from app.database import SessionLocal
-from app.models.user import User
-from jose import JWTError, jwt
-from app.routers import emails, analysis, dashboard, integrations
-from app.routers import lookups, replies, domains, document_intake
+from app.routers import dashboard, integrations, domains, document_intake
 from app.routers.auth import router as auth_router
 from app.routers.admin import router as admin_router
 from app.routers.logs import router as logs_router
-from app.routers.reply_tracker import router as reply_tracker_router
-from app.services.notification_service import notification_manager
 from app.services.gmail_sync import start_email_poller
 from app.middleware.logging import RequestLoggingMiddleware
+from app.observability import RequestContextMiddleware, configure_logging, metrics_response
+import app.jobs  # noqa: F401  (registers background job functions)
 
-# ── Seed lookup tables ────────────────────────────────────────
-def _seed_lookups():
-    from app.models.email import (
-        SentimentOption,
-        PriorityOption,
-        CategoryOption,
-        AllowedDomain,
-    )
+configure_logging()
+
+# ── Start-up ──────────────────────────────────────────────────
+def _seed_templates():
+    from app.services.document_intake.template_renderer import seed_default_templates
 
     db = SessionLocal()
-
     try:
-        if db.query(SentimentOption).count() == 0:
-            db.bulk_insert_mappings(
-                cast(Any, SentimentOption),
-                [
-                    {"value": "positive", "label": "Positive", "color": "green", "sort_order": 1},
-                    {"value": "neutral", "label": "Neutral", "color": "gray", "sort_order": 2},
-                    {"value": "negative", "label": "Negative", "color": "red", "sort_order": 3},
-                ],
-            )
-
-        if db.query(PriorityOption).count() == 0:
-            db.bulk_insert_mappings(
-                cast(Any, PriorityOption),
-                [
-                    {"value": "critical", "label": "Critical", "color": "red", "score": 4, "sort_order": 1},
-                    {"value": "high", "label": "High", "color": "orange", "score": 3, "sort_order": 2},
-                    {"value": "medium", "label": "Medium", "color": "yellow", "score": 2, "sort_order": 3},
-                    {"value": "low", "label": "Low", "color": "blue", "score": 1, "sort_order": 4},
-                ],
-            )
-
-        if db.query(CategoryOption).count() == 0:
-            db.bulk_insert_mappings(
-                cast(Any, CategoryOption),
-                [
-                    {"value": "complaint", "label": "Complaint", "description": "Customer complaints", "sort_order": 1},
-                    {"value": "support", "label": "Support", "description": "Technical support requests", "sort_order": 2},
-                    {"value": "sales", "label": "Sales", "description": "Sales inquiries and leads", "sort_order": 3},
-                    {"value": "refund", "label": "Refund", "description": "Refund and cancellation", "sort_order": 4},
-                    {"value": "invoice", "label": "Invoice", "description": "Billing queries", "sort_order": 5},
-                    {"value": "feedback", "label": "Feedback", "description": "Product feedback", "sort_order": 6},
-                    {"value": "general", "label": "General", "description": "General enquiries", "sort_order": 7},
-                ],
-            )
-
-        if db.query(AllowedDomain).count() == 0:
-            db.bulk_insert_mappings(
-                cast(Any, AllowedDomain),
-                [
-                    {"domain": "gmail.com", "is_active": True, "notes": "Google Gmail"},
-                    {"domain": "outlook.com", "is_active": True, "notes": "Microsoft Outlook"},
-                    {"domain": "hotmail.com", "is_active": True, "notes": "Microsoft Hotmail"},
-                    {"domain": "yahoo.com", "is_active": True, "notes": "Yahoo Mail"},
-                    {"domain": "icloud.com", "is_active": True, "notes": "Apple iCloud Mail"},
-                    {"domain": "protonmail.com", "is_active": True, "notes": "ProtonMail"},
-                ],
-            )
-
-        db.commit()
-        logger.info("Lookup tables seeded.")
-
+        seed_default_templates(db)
     except Exception as exc:
-        logger.error(f"Lookup seeding failed: {exc}")
+        logger.error(f"Template seeding failed: {exc}")
         db.rollback()
-
     finally:
         db.close()
 
 
-# ── Application Lifespan ──────────────────────────────────────
-poller_task = None
-retention_task = None
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global poller_task, retention_task
-
     logger.info("🚀 Starting application")
+    _seed_templates()
 
-    _seed_lookups()
-
+    poller: asyncio.Task | None = None
     if settings.RUN_BACKGROUND_WORKERS:
-        poller_task = asyncio.create_task(start_email_poller())
-
-        from app.services.document_intake.retention_service import start_retention_archiver
-        retention_task = asyncio.create_task(start_retention_archiver())
+        # New mail is picked up and processed inside this process, so nothing
+        # else has to be started. Production can run app.worker instead.
+        from app.jobs.queue import use_inline_only
+        use_inline_only(True)
+        poller = asyncio.create_task(start_email_poller())
 
     yield
 
     logger.info("🛑 Shutting down")
+    if poller:
+        poller.cancel()
+        try:
+            await poller
+        except asyncio.CancelledError:
+            pass
 
-    for task in (poller_task, retention_task):
-        if task:
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
 
 # ── FastAPI App ───────────────────────────────────────────────
 app = FastAPI(
     title=settings.APP_NAME,
     version=settings.APP_VERSION,
-    description="AI-powered email management system with sentiment analysis and NLP",
-    docs_url="/docs",
-    redoc_url="/redoc",
+    description="Automatic email intake: domain check, acknowledgement, attachment validation, PDF conversion and merge",
+    docs_url="/docs" if settings.ENABLE_API_DOCS else None,
+    redoc_url="/redoc" if settings.ENABLE_API_DOCS else None,
+    openapi_url="/openapi.json" if settings.ENABLE_API_DOCS else None,
     lifespan=lifespan,
 )
 
@@ -136,6 +72,20 @@ app = FastAPI(
 # Add request logging first so CORS remains outermost and headers
 # are still attached when downstream handlers fail.
 app.add_middleware(RequestLoggingMiddleware)
+app.add_middleware(RequestContextMiddleware)
+
+@app.middleware("http")
+async def security_headers(request, call_next):
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    if not request.url.path.startswith(("/docs", "/redoc")):
+        response.headers.setdefault("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'")
+    if settings.IS_PRODUCTION:
+        response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+    return response
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -150,65 +100,125 @@ app.add_middleware(
 app.include_router(auth_router, prefix="/api/auth", tags=["Auth"])
 app.include_router(admin_router, prefix="/api/admin", tags=["Admin"])
 app.include_router(logs_router, prefix="/api/logs", tags=["Logs"])
-app.include_router(emails.router, prefix="/api/emails", tags=["Emails"])
-app.include_router(analysis.router, prefix="/api/analysis", tags=["Analysis"])
 app.include_router(dashboard.router, prefix="/api/dashboard", tags=["Dashboard"])
-app.include_router(integrations.router, prefix="/api/integrations", tags=["Integrations"])
-app.include_router(lookups.router, prefix="/api/lookups", tags=["Lookups"])
-app.include_router(replies.router, prefix="/api/emails", tags=["Replies"])
+app.include_router(integrations.router, prefix="/api/integrations", tags=["Mailboxes"])
 app.include_router(domains.router, prefix="/api/domains", tags=["Domains"])
-app.include_router(reply_tracker_router, prefix="/api/reply-tracker", tags=["ReplyTracker"])
-app.include_router(document_intake.router, prefix="/api/document-intake", tags=["DocumentIntake"])
+app.include_router(document_intake.router, prefix="/api/document-intake", tags=["Emails"])
 
 
-# ── WebSocket – Real-time notifications ──────────────────────
-@app.websocket("/ws/notifications")
-async def websocket_notifications(websocket: WebSocket):
-    token = websocket.query_params.get("access_token")
-    if not token:
-        await websocket.close(code=1008, reason="Authentication required")
-        return
+# ── Health, readiness and metrics ─────────────────────────────
+_llm_health_cache: dict[str, Any] = {"checked_at": 0.0, "ok": None, "detail": None}
+
+
+def llm_model_status(status_code: int, payload: dict | None, model: str, provider: str) -> tuple[bool, str]:
+    """Interpret the LLM backend's model listing: reachable AND the configured model is available."""
+    if status_code >= 400:
+        return False, f"HTTP {status_code}"
+    payload = payload or {}
+    if provider == "ollama":
+        names = {m.get("name", "") for m in payload.get("models", [])}
+        # Ollama lists "llama3.2:latest"; the config may say "llama3.2".
+        available = model in names or f"{model}:latest" in names
+    else:
+        available = model in {m.get("id", "") for m in payload.get("data", [])}
+    if not available:
+        return False, f"model '{model}' is not available on the {provider} server"
+    return True, f"model '{model}' available"
+
+
+async def _check_llm() -> tuple[bool | None, str | None]:
+    """Probe the LLM backend: reachable and the configured model installed (cached for 60s)."""
+    import time
+    import httpx
+    from app.services.ai_client import ai_available, get_model
+
+    if not settings.HEALTH_CHECK_LLM or not ai_available():
+        return None, "not configured"
+    if time.monotonic() - _llm_health_cache["checked_at"] < 60:
+        return _llm_health_cache["ok"], _llm_health_cache["detail"]
+    provider = "ollama" if settings.OLLAMA_BASE_URL else "openai"
     try:
-        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
-        if payload.get("type") != "access":
-            raise ValueError("Invalid token type")
-        user_id = int(payload["sub"])
-    except (JWTError, ValueError, TypeError, KeyError):
-        await websocket.close(code=1008, reason="Invalid authentication token")
-        return
-
-    db = SessionLocal()
-    try:
-        user = db.query(User).filter(User.id == user_id, User.is_active == True).first()
-    finally:
-        db.close()
-    if not user:
-        await websocket.close(code=1008, reason="Invalid authentication token")
-        return
-
-    await notification_manager.connect(
-        websocket,
-        user_id,
-        cast(str, user.role),
-    )
-
-    try:
-        while True:
-            await asyncio.sleep(30)
-            await websocket.send_json({"type": "ping"})
-
-    except WebSocketDisconnect:
-        notification_manager.disconnect(websocket)
-
+        async with httpx.AsyncClient(timeout=3) as client:
+            if provider == "ollama":
+                response = await client.get(f"{settings.OLLAMA_BASE_URL.rstrip('/')}/api/tags")
+            else:
+                response = await client.get(
+                    "https://api.openai.com/v1/models",
+                    headers={"Authorization": f"Bearer {settings.OPENAI_API_KEY}"},
+                )
+        try:
+            payload = response.json()
+        except ValueError:
+            payload = None
+        ok, detail = llm_model_status(response.status_code, payload, get_model(), provider)
     except Exception as exc:
-        logger.error(f"WebSocket error: {exc}")
-        notification_manager.disconnect(websocket)
+        ok, detail = False, type(exc).__name__
+    _llm_health_cache.update(checked_at=time.monotonic(), ok=ok, detail=detail)
+    return ok, detail
 
 
-# ── Health Check ──────────────────────────────────────────────
+async def _check_redis() -> bool | None:
+    if not settings.REDIS_URL:
+        return None
+    try:
+        import redis.asyncio as aioredis
+        client = aioredis.from_url(settings.REDIS_URL, socket_connect_timeout=2)
+        try:
+            return bool(await client.ping())
+        finally:
+            await client.aclose()
+    except Exception:
+        return False
+
+
+def _check_database() -> bool:
+    from sqlalchemy import text
+    try:
+        db = SessionLocal()
+        try:
+            db.execute(text("SELECT 1"))
+        finally:
+            db.close()
+        return True
+    except Exception as exc:
+        logger.error(f"Health check database error: {exc}")
+        return False
+
+
+@app.get("/health/live", tags=["System"])
+def liveness():
+    """Process is up (no dependency checks) — for container liveness probes."""
+    return {"status": "ok"}
+
+
 @app.get("/health", tags=["System"])
 async def health_check():
-    return {
-        "status": "ok",
+    """Readiness: database is required (503 if down); Redis and the LLM degrade gracefully."""
+    from fastapi.responses import JSONResponse
+
+    db_ok = await asyncio.to_thread(_check_database)
+    redis_ok = await _check_redis()
+    llm_ok, llm_detail = await _check_llm()
+    from app.services.document_intake.conversion.doc_to_pdf import converter_status
+    converter_ok, converter_detail = converter_status()
+    degraded = llm_ok is False or not converter_ok
+    body = {
+        "status": "down" if not db_ok else ("degraded" if degraded else "ok"),
         "version": settings.APP_VERSION,
+        "database": db_ok,
+        "redis": redis_ok,
+        "llm": {"ok": llm_ok, "detail": llm_detail},
+        "converter": {"ok": converter_ok, "detail": converter_detail},
+        "mail_pickup": "api" if settings.RUN_BACKGROUND_WORKERS else "worker",
+        "ops_alerts": bool(settings.OPS_ALERT_WEBHOOK_URL),
     }
+    return JSONResponse(body, status_code=200 if db_ok else 503)
+
+
+@app.get("/metrics", include_in_schema=False)
+def metrics(request: Request):
+    """Prometheus metrics (set METRICS_TOKEN to require a bearer token)."""
+    if not settings.METRICS_ENABLED:
+        from fastapi.responses import Response
+        return Response(status_code=404)
+    return metrics_response(request)

@@ -5,9 +5,16 @@ with OpenAI as fallback for ambiguous cases.
 """
 from __future__ import annotations
 import re
+
+from loguru import logger
 from dataclasses import dataclass
-from app.config import settings
-from app.services.ai_client import get_ai_client, get_model, ai_available
+from app.services.ai_client import (
+    get_ai_client, get_model, ai_available, fence_untrusted, UNTRUSTED_NOTE, parse_json_response,
+)
+
+from app.observability import LLM_CALLS
+
+VALID_CATEGORIES = ("complaint", "support", "sales", "refund", "invoice", "feedback", "general")
 
 # ── Category keyword map ──────────────────────────────────────
 _CATEGORY_KEYWORDS: dict[str, list[str]] = {
@@ -92,7 +99,7 @@ async def _openai_classify(text: str) -> ClassificationResult:
             "Classify the following email into exactly ONE of these categories:\n"
             "complaint, support, sales, refund, invoice, feedback, general\n\n"
             "Respond with ONLY a JSON object like: {\"category\": \"support\", \"confidence\": 0.9}\n\n"
-            f"Email:\n{text[:1500]}"
+            f"{UNTRUSTED_NOTE}\n\nEmail:\n{fence_untrusted(text, 1500)}"
         )
 
         response = await client.chat.completions.create(
@@ -102,17 +109,16 @@ async def _openai_classify(text: str) -> ClassificationResult:
             max_tokens=60,
         )
 
-        import json
-        content = response.choices[0].message.content.strip()
-        # Clean any markdown block formatting if model returns ```json ... ```
-        if content.startswith("```"):
-            content = re.sub(r"^```(?:json)?\s*|\s*```$", "", content, flags=re.MULTILINE).strip()
-        data = json.loads(content)
-        return ClassificationResult(
-            category=data.get("category", "general"),
-            confidence=float(data.get("confidence", 0.5)),
-        )
-    except Exception:
+        data = parse_json_response(response.choices[0].message.content)
+        category = str(data.get("category", "general")).strip().lower()
+        if category not in VALID_CATEGORIES:
+            category = "general"
+        confidence = min(1.0, max(0.0, float(data.get("confidence", 0.5))))
+        LLM_CALLS.labels("classify", "success").inc()
+        return ClassificationResult(category=category, confidence=round(confidence, 3))
+    except Exception as exc:
+        LLM_CALLS.labels("classify", "error").inc()
+        logger.warning(f"[classifier] LLM classification failed, using 'general': {exc}")
         return ClassificationResult(category="general", confidence=0.3)
 
 
@@ -131,7 +137,5 @@ async def classify_email(text: str) -> ClassificationResult:
         if ai_available():
             return await _openai_classify(text)
         return result or ClassificationResult(category="general", confidence=0.3)
-
-    return result
 
     return result

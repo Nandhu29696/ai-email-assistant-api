@@ -1,4 +1,3 @@
-import pytest
 from app.utils.crypto import encrypt_token, decrypt_token
 from app.routers.auth import hash_password, verify_password, create_access_token
 from jose import jwt

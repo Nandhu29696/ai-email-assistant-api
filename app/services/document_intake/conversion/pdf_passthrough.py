@@ -11,6 +11,8 @@ def convert_pdf_passthrough(data: bytes) -> bytes:
     from pypdf import PdfReader, PdfWriter
 
     reader = PdfReader(io.BytesIO(data))
+    if reader.is_encrypted and not reader.decrypt(""):
+        raise ValueError("PDF is password-protected")
     writer = PdfWriter()
     for page in reader.pages:
         writer.add_page(page)

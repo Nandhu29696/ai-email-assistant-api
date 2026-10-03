@@ -1,31 +1,15 @@
-from app.services.gmail_sync import _is_automated_or_self_message
+from app.services.document_intake.sender_checks import is_automated_message
 
 
-def test_self_message_is_skipped_for_auto_reply():
-    assert _is_automated_or_self_message({}, "Mailbox@Example.com", "mailbox@example.com")
+def test_automated_messages_are_detected():
+    assert is_automated_message({"Auto-Submitted": "auto-replied"}, "person@example.com")
+    assert is_automated_message({"Precedence": "bulk"}, "person@example.com")
+    assert is_automated_message({"List-Unsubscribe": "<mailto:x@example.com>"}, "news@example.com")
+    assert is_automated_message({"Subject": "Out of Office: back Monday"}, "person@example.com")
+    assert is_automated_message({}, "mailer-daemon@googlemail.com")
+    assert is_automated_message({}, "no-reply@example.com")
+    assert is_automated_message({}, "")
 
 
-def test_automated_message_is_skipped_for_auto_reply():
-    assert _is_automated_or_self_message(
-        {"Auto-Submitted": "auto-generated"},
-        "sender@example.com",
-        "mailbox@example.com",
-    )
-    assert _is_automated_or_self_message(
-        {"Precedence": "junk"},
-        "sender@example.com",
-        "mailbox@example.com",
-    )
-    assert _is_automated_or_self_message(
-        {"auto-submitted": "auto-generated"},
-        "sender@example.com",
-        "mailbox@example.com",
-    )
-
-
-def test_regular_message_can_receive_auto_reply():
-    assert not _is_automated_or_self_message(
-        {"Subject": "Hello"},
-        "sender@example.com",
-        "mailbox@example.com",
-    )
+def test_regular_message_is_not_automated():
+    assert not is_automated_message({"Subject": "Claim documents", "Auto-Submitted": "no"}, "client@example.com")

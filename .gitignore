@@ -62,3 +62,6 @@ token.json
 *.pem
 *.key
 service_account.json
+
+# Customer documents & reply attachments (never commit)
+storage/

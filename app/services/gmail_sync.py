@@ -1,31 +1,37 @@
 """
 Gmail sync service.
-Polls all active Gmail integrations every FETCH_INTERVAL_SECONDS,
-saves new emails to the DB, and triggers the AI analysis pipeline.
+
+Sync is incremental: after an initial baseline (unread Inbox messages), new
+mail is discovered with ``users.history.list`` from the stored ``historyId``,
+so messages are found regardless of their read state. When
+``GMAIL_PUBSUB_TOPIC`` is configured, ``users.watch`` push notifications
+trigger syncs in near real time (polling remains as a safety net).
+
+Each discovered message is processed by its own idempotent, retryable
+background job (``process_gmail_message``) that runs the intake pipeline.
+
+All Gmail API calls are blocking (googleapiclient) and run in worker threads.
 """
 from __future__ import annotations
 
 import asyncio
 import base64
 from email.utils import parseaddr, parsedate_to_datetime
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, cast
 
 from loguru import logger
-from sqlalchemy.exc import IntegrityError
 
 from app.config import settings
 from app.database import SessionLocal
-from app.models.email import Email, EmailIntegration, AllowedDomain
-from app.utils.crypto import decrypt_token, encrypt_token
+from app.models.email import EmailIntegration
+from app.services.gmail_client import build_gmail_service, GmailAuthError
 
-# Cap concurrent AI-pipeline tasks so we never hold more than this
-# many DB connections simultaneously for analysis work.
-_analysis_semaphore = asyncio.Semaphore(3)
+_SKIP_LABELS = {"DRAFT", "SENT", "SPAM", "TRASH"}
 
 
 def _mark_message_read(service, msg_id: str) -> None:
-    """Best-effort: remove UNREAD label so blocked messages are not reprocessed forever."""
+    """Best-effort: remove UNREAD so processed messages are visibly handled."""
     try:
         service.users().messages().modify(
             userId="me",
@@ -33,32 +39,11 @@ def _mark_message_read(service, msg_id: str) -> None:
             body={"removeLabelIds": ["UNREAD"]},
         ).execute()
     except Exception as exc:
-        logger.warning(f"[gmail_sync] Failed to mark blocked message {msg_id} as read: {exc}")
+        logger.warning(f"[gmail_sync] Failed to mark message {msg_id} as read: {exc}")
 
 
-def _is_automated_or_self_message(
-    headers: dict[str, str],
-    sender_email: str,
-    recipient_email: str,
-) -> bool:
-    """Identify messages that should not receive an automated rejection reply."""
-    sender = sender_email.strip().lower()
-    recipient = recipient_email.strip().lower()
-    if sender and recipient and sender == recipient:
-        return True
-
-    normalized_headers = {
-        key.strip().lower(): str(value).strip().lower()
-        for key, value in headers.items()
-    }
-    return any(
-        normalized_headers.get(header, "") in values
-        for header, values in {
-            "auto-submitted": {"auto-generated", "auto-replied", "auto-notified"},
-            "precedence": {"bulk", "junk", "list"},
-            "x-auto-response-suppress": {"all", "auto-reply"},
-        }.items()
-    )
+# Re-exported for older imports.
+from app.services.document_intake.sender_checks import sender_authentication_failed  # noqa: E402,F401
 
 
 # ── Body extraction ───────────────────────────────────────────
@@ -68,14 +53,14 @@ def _extract_gmail_body(payload: dict) -> tuple[str, str]:
     plain, html = "", ""
     mime_type = payload.get("mimeType", "")
 
-    if mime_type == "text/plain":
+    if mime_type == "text/plain" and not payload.get("filename"):
         data = payload.get("body", {}).get("data", "")
         if data:
-            plain = base64.urlsafe_b64decode(data + "==").decode("utf-8", errors="replace")
-    elif mime_type == "text/html":
+            plain = base64.urlsafe_b64decode(data + "=" * (-len(data) % 4)).decode("utf-8", errors="replace")
+    elif mime_type == "text/html" and not payload.get("filename"):
         data = payload.get("body", {}).get("data", "")
         if data:
-            html = base64.urlsafe_b64decode(data + "==").decode("utf-8", errors="replace")
+            html = base64.urlsafe_b64decode(data + "=" * (-len(data) % 4)).decode("utf-8", errors="replace")
     elif "parts" in payload:
         for part in payload["parts"]:
             p, h = _extract_gmail_body(part)
@@ -85,20 +70,134 @@ def _extract_gmail_body(payload: dict) -> tuple[str, str]:
     return plain, html
 
 
-# ── Per-integration sync ──────────────────────────────────────
-async def sync_gmail_integration(integration_id: int) -> int:
-    """
-    Fetch unread emails for one Gmail integration.
-    Saves new emails to DB, marks Gmail messages as read,
-    and queues AI analysis.
-    """
-    from google.auth.transport.requests import Request
-    from google.oauth2.credentials import Credentials
-    from googleapiclient.discovery import build
+def _parse_received_at(date_str: str) -> datetime:
+    try:
+        value = parsedate_to_datetime(date_str)
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    except Exception:
+        return datetime.now(timezone.utc)
 
-    # ---------------------------------------------------------
-    # Load integration
-    # ---------------------------------------------------------
+
+def build_intake_context_from_gmail(msg: dict, recipient_addr: str):
+    """Build the document-intake context for a Gmail API ``format=full`` message."""
+    from app.services.document_intake.pipeline import IntakeEmailContext
+    from app.services.preprocessor import strip_html
+
+    headers = {h["name"]: h["value"] for h in msg.get("payload", {}).get("headers", [])}
+    lower_headers = {k.lower(): v for k, v in headers.items()}
+    gmail_msg_id = msg["id"]
+    message_id_header = lower_headers.get("message-id", "").strip().strip("<>")
+    sender_name, sender_email = parseaddr(lower_headers.get("from", ""))
+
+    plain, html = _extract_gmail_body(msg.get("payload", {}))
+    if not plain and html:
+        plain = strip_html(html)
+    intake_headers = dict(headers)
+    intake_headers["_body_plain"] = plain
+
+    return IntakeEmailContext(
+        gmail_message_id=gmail_msg_id,
+        stored_message_id=message_id_header or gmail_msg_id,
+        thread_id=msg.get("threadId"),
+        headers=intake_headers,
+        sender_name=sender_name,
+        sender_email=sender_email,
+        recipient_email=recipient_addr,
+        subject=lower_headers.get("subject") or "(no subject)",
+        received_at=_parse_received_at(lower_headers.get("date", "")),
+        payload=msg.get("payload", {}),
+    )
+
+
+def _update_health(integration_id: int, status: str, message: str, new_count: int = 0, **fields) -> None:
+    db = SessionLocal()
+    try:
+        row = db.query(EmailIntegration).filter(EmailIntegration.id == integration_id).first()
+        if row:
+            status_row = cast(Any, row)
+            now = datetime.now(timezone.utc)
+            if status == "healthy":
+                status_row.last_sync_at = now
+                if new_count:
+                    status_row.last_email_processed_at = now
+            previous = status_row.health_status
+            status_row.health_status = status
+            status_row.health_message = message[:1000]
+            for key, value in fields.items():
+                setattr(status_row, key, value)
+            db.commit()
+            from app.services.ops_alert import mailbox_health_changed
+            mailbox_health_changed(status_row.email_address, previous, status, message)
+    except Exception as exc:
+        logger.warning(f"[gmail_sync] Failed to update health status: {exc}")
+        db.rollback()
+    finally:
+        db.close()
+
+
+# ── Discovery (history.list) ──────────────────────────────────
+def _history_message_ids(service, start_history_id: str) -> tuple[list[str], str]:
+    """Message ids added to the Inbox since ``start_history_id``, and the latest historyId."""
+    ids: list[str] = []
+    latest = start_history_id
+    page_token = None
+    while True:
+        response = service.users().history().list(
+            userId="me",
+            startHistoryId=start_history_id,
+            historyTypes=["messageAdded"],
+            labelId="INBOX",
+            pageToken=page_token,
+            maxResults=500,
+        ).execute()
+        for record in response.get("history", []):
+            for added in record.get("messagesAdded", []):
+                message = added.get("message", {})
+                labels = set(message.get("labelIds", []))
+                if "INBOX" in labels and not labels & _SKIP_LABELS:
+                    ids.append(message["id"])
+        latest = response.get("historyId", latest)
+        page_token = response.get("nextPageToken")
+        if not page_token:
+            break
+    return list(dict.fromkeys(ids)), str(latest)
+
+
+def _baseline_message_ids(service) -> tuple[list[str], str]:
+    """Initial sync / history expired: current historyId + unread Inbox messages."""
+    history_id = str(service.users().getProfile(userId="me").execute()["historyId"])
+    ids: list[str] = []
+    page_token = None
+    for _ in range(10):  # at most 500 messages in a baseline
+        response = service.users().messages().list(
+            userId="me", q="is:unread in:inbox", maxResults=50, pageToken=page_token,
+        ).execute()
+        ids.extend(m["id"] for m in response.get("messages", []))
+        page_token = response.get("nextPageToken")
+        if not page_token:
+            break
+    return ids, history_id
+
+
+def _discover(service, history_id: str | None) -> tuple[list[str], str, bool]:
+    from googleapiclient.errors import HttpError
+
+    if history_id:
+        try:
+            ids, latest = _history_message_ids(service, history_id)
+            return ids, latest, False
+        except HttpError as exc:
+            if getattr(exc.resp, "status", None) != 404:
+                raise
+            logger.warning("[gmail_sync] historyId expired; running a baseline resync")
+    ids, latest = _baseline_message_ids(service)
+    return ids, latest, True
+
+
+async def sync_gmail_integration(integration_id: int) -> int:
+    """Discover new messages for one Gmail mailbox and queue a job per message."""
+    from app.jobs.queue import enqueue
+
     db = SessionLocal()
     try:
         integration = (
@@ -110,501 +209,124 @@ async def sync_gmail_integration(integration_id: int) -> int:
             )
             .first()
         )
-
         if integration is None or integration.access_token is None:
             return 0
-
-        access_token = decrypt_token(cast(str | None, integration.access_token))
-        refresh_token = decrypt_token(cast(str | None, integration.refresh_token))
-        recipient_addr = cast(str, integration.email_address)
-        integration_pk = cast(int, integration.id)
-        configured_processing_mode = cast(str | None, integration.processing_mode)
-        processing_mode = configured_processing_mode or "conversation"
-        conversation_analysis_enabled = (
-            cast(bool, integration.conversation_analysis_enabled)
-            if integration.conversation_analysis_enabled is not None
-            else True
-        )
-
+        history_id = integration.gmail_history_id
+        recipient_addr = integration.email_address
     finally:
         db.close()
 
-    creds = Credentials(
-        token=access_token,
-        refresh_token=refresh_token,
-        token_uri="https://oauth2.googleapis.com/token",
-        client_id=settings.GMAIL_CLIENT_ID,
-        client_secret=settings.GMAIL_CLIENT_SECRET,
-        scopes=[
-            "openid",
-            "https://www.googleapis.com/auth/userinfo.email",
-            "https://www.googleapis.com/auth/gmail.modify",
-            "https://www.googleapis.com/auth/gmail.send",
-        ],
+    try:
+        service = await asyncio.to_thread(build_gmail_service, integration_id)
+    except GmailAuthError as exc:
+        logger.error(f"[gmail_sync] {recipient_addr}: {exc}")
+        return 0
+
+    try:
+        message_ids, latest_history_id, baseline = await asyncio.to_thread(_discover, service, history_id)
+    except Exception as exc:
+        logger.error(f"[gmail_sync] Discovery failed for {recipient_addr}: {exc}")
+        _update_health(integration_id, "error", f"Failed to list messages: {exc}")
+        raise
+
+    for gmail_msg_id in message_ids:
+        await enqueue(
+            "process_gmail_message", integration_id, gmail_msg_id,
+            job_id=f"gmail:{integration_id}:{gmail_msg_id}",
+        )
+
+    # Advance the cursor only after every message has been queued.
+    _update_health(
+        integration_id, "healthy",
+        f"Queued {len(message_ids)} message(s){' (baseline)' if baseline else ''}",
+        len(message_ids), gmail_history_id=latest_history_id,
     )
+    return len(message_ids)
 
-    # ---------------------------------------------------------
-    # Refresh token
-    # ---------------------------------------------------------
-    if creds.expired and creds.refresh_token:
-        try:
-            creds.refresh(Request())
 
-            db2 = SessionLocal()
-            try:
-                row = (
-                    db2.query(EmailIntegration)
-                    .filter(EmailIntegration.id == integration_pk)
-                    .first()
-                )
+# ── Per-message processing (runs as a job) ────────────────────
+async def process_gmail_message(integration_id: int, gmail_msg_id: str) -> str:
+    """Run the intake pipeline for one Gmail message. Idempotent."""
+    from googleapiclient.errors import HttpError
+    from app.services.document_intake.pipeline import process_document_intake_email
 
-                if row:
-                    setattr(row, "access_token", encrypt_token(creds.token))
-                    db2.commit()
-
-            finally:
-                db2.close()
-
-            logger.info(
-                f"[gmail_sync] Token refreshed for {recipient_addr}"
-            )
-
-        except Exception as exc:
-            logger.error(
-                f"[gmail_sync] Token refresh failed for {recipient_addr}: {exc}"
-            )
-            return 0
-
-    # ---------------------------------------------------------
-    # Gmail service
-    # ---------------------------------------------------------
+    db = SessionLocal()
     try:
-        service = build(
-            "gmail",
-            "v1",
-            credentials=creds,
-            cache_discovery=False,
-        )
-    except Exception as exc:
-        logger.error(
-            f"[gmail_sync] Failed to build Gmail service: {exc}"
-        )
-        return 0
-
-    # ---------------------------------------------------------
-    # Load whitelist once
-    # ---------------------------------------------------------
-    db_domains = SessionLocal()
-    try:
-        allowed_domains = {
-            d.domain.lower().strip()
-            for d in db_domains.query(AllowedDomain)
-            .filter(AllowedDomain.is_active == True)
-            .all()
-        }
+        integration = db.query(EmailIntegration).filter(
+            EmailIntegration.id == integration_id, EmailIntegration.is_active == True,
+        ).first()
+        if not integration:
+            return "skipped"
+        recipient_addr = integration.email_address
     finally:
-        db_domains.close()
+        db.close()
 
-    # ---------------------------------------------------------
-    # Fetch unread emails
-    # ---------------------------------------------------------
+    service = await asyncio.to_thread(build_gmail_service, integration_id)
     try:
-        result = (
-            service.users()
-            .messages()
-            .list(
-                userId="me",
-                q="is:unread in:inbox",
-                maxResults=50,
-            )
-            .execute()
+        msg = await asyncio.to_thread(
+            lambda: service.users().messages().get(userId="me", id=gmail_msg_id, format="full").execute()
         )
-    except Exception as exc:
-        logger.error(
-            f"[gmail_sync] Failed to fetch unread messages: {exc}"
-        )
-        return 0
+    except HttpError as exc:
+        if getattr(exc.resp, "status", None) == 404:
+            return "gone"  # deleted before we got to it
+        raise
 
-    messages = result.get("messages", [])
+    labels = set(msg.get("labelIds", []))
+    if labels & _SKIP_LABELS:
+        return "skipped"
 
-    if not messages:
-        return 0
+    ctx = build_intake_context_from_gmail(msg, recipient_addr)
+    status = await process_document_intake_email(integration_id, service, ctx)
 
-    new_count = 0
-    new_email_ids: list[int] = []
+    # Emails from before the mailbox was connected are left untouched.
+    if settings.GMAIL_MARK_PROCESSED_READ and status != "SKIPPED_OLD":
+        await asyncio.to_thread(_mark_message_read, service, gmail_msg_id)
+    return status
 
-    for msg_meta in messages:
-        gmail_msg_id = msg_meta["id"]
 
-        # -----------------------------------------------------
-        # Fetch full message
-        # -----------------------------------------------------
-        try:
-            msg = (
-                service.users()
-                .messages()
-                .get(
-                    userId="me",
-                    id=gmail_msg_id,
-                    format="full",
-                )
-                .execute()
-            )
-
-        except Exception as exc:
-            logger.warning(
-                f"[gmail_sync] Failed to fetch message {gmail_msg_id}: {exc}"
-            )
-            continue
-
-        headers = {
-            h["name"]: h["value"]
-            for h in msg.get("payload", {}).get("headers", [])
-        }
-
-        subject = headers.get("Subject", "(no subject)")
-        from_raw = headers.get("From", "")
-        date_str = headers.get("Date", "")
-        thread_id = msg.get("threadId")
-
-        message_id_header = (
-            headers.get("Message-ID", "")
-            .strip()
-            .strip("<>")
-        )
-
-        stored_message_id = (
-            message_id_header or gmail_msg_id
-        )
-
-        sender_name, sender_email = (
-            parseaddr(from_raw)
-        )
-
-        sender_domain = (
-            sender_email.split("@")[-1].lower()
-            if "@" in sender_email
-            else ""
-        )
-
-        # -----------------------------------------------------
-        # Document-intake pipeline branch (§1.1: processing_mode)
-        # Runs independently of the conversational flow below;
-        # for "document_intake"-only integrations we skip creating
-        # the conversational Email row entirely for this message.
-        # -----------------------------------------------------
-        if processing_mode in ("document_intake", "both"):
-            try:
-                received_at_for_intake = parsedate_to_datetime(date_str)
-            except Exception:
-                received_at_for_intake = datetime.now(timezone.utc)
-
-            plain_for_intake, _html_for_intake = _extract_gmail_body(msg.get("payload", {}))
-            intake_headers = dict(headers)
-            intake_headers["_body_plain"] = plain_for_intake
-
-            from app.services.document_intake.pipeline import (
-                process_document_intake_email, IntakeEmailContext,
-            )
-
-            ctx = IntakeEmailContext(
-                gmail_message_id=gmail_msg_id,
-                stored_message_id=stored_message_id,
-                thread_id=thread_id,
-                headers=intake_headers,
-                sender_name=sender_name,
-                sender_email=sender_email,
-                recipient_email=recipient_addr,
-                subject=subject,
-                received_at=received_at_for_intake,
-                payload=msg.get("payload", {}),
-            )
-
-            try:
-                await process_document_intake_email(integration_pk, service, ctx)
-            except Exception as exc:
-                logger.error(f"[gmail_sync] Document intake pipeline failed for {gmail_msg_id}: {exc}")
-
-            # The pipeline has durably created or found the batch. Do this even
-            # for a failed terminal status so the same unread message is not
-            # submitted on every polling cycle.
-            _mark_message_read(service, gmail_msg_id)
-
-            if processing_mode == "document_intake":
-                continue
-
-        # -----------------------------------------------------
-        # Duplicate check
-        # -----------------------------------------------------
-        db_check = SessionLocal()
-        try:
-            existing_email = (
-                db_check.query(Email)
-                .filter(
-                    Email.message_id == stored_message_id
-                )
-                .first()
-            )
-
-            if existing_email:
-                _mark_message_read(
-                    service,
-                    gmail_msg_id,
-                )
-                continue
-
-        finally:
-            db_check.close()
-
-        # -----------------------------------------------------
-        # Domain whitelist
-        # -----------------------------------------------------
-        is_allowed = (
-            not allowed_domains
-            or sender_domain in allowed_domains
-        )
-
-        if not is_allowed:
-
-            logger.info(
-                f"[gmail_sync] Blocked email from "
-                f"{sender_email} ({sender_domain})"
-            )
-
-            sender_lower = sender_email.lower()
-
-            is_system_sender = _is_automated_or_self_message(
-                headers,
-                sender_email,
-                recipient_addr,
-            ) or (
-                sender_lower.startswith("mailer-daemon")
-                or sender_lower.startswith("postmaster")
-                or "noreply" in sender_lower
-                or "no-reply" in sender_lower
-                or sender_domain in {
-                    "google.com",
-                    "googlemail.com",
-                    "accounts.google.com",
-                }
-            )
-
-            if not is_system_sender:
-                try:
-                    _send_domain_rejection(
-                        service,
-                        sender_email,
-                        recipient_addr,
-                        subject,
-                        thread_id,
-                        message_id_header,
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        f"[gmail_sync] Auto-reply failed: {exc}"
-                    )
-
-            _mark_message_read(
-                service,
-                gmail_msg_id,
-            )
-            continue
-
-        # -----------------------------------------------------
-        # Parse date/body
-        # -----------------------------------------------------
-        try:
-            received_at = (
-                parsedate_to_datetime(
-                    date_str
-                )
-            )
-        except Exception:
-            received_at = datetime.now(
-                timezone.utc
-            )
-
-        plain, html = _extract_gmail_body(
-            msg.get("payload", {})
-        )
-
-        # -----------------------------------------------------
-        # Save email
-        # -----------------------------------------------------
-        db_email = SessionLocal()
-
-        try:
-            email_obj = Email(
-                message_id=stored_message_id,
-                integration_id=integration_pk,
-                subject=subject,
-                sender_name=sender_name,
-                sender_email=sender_email,
-                recipient_email=recipient_addr,
-                body_plain=plain,
-                body_html=html,
-                received_at=received_at,
-                thread_id=thread_id,
-            )
-
-            db_email.add(email_obj)
-            db_email.commit()
-            db_email.refresh(email_obj)
-
-            try:
-                _mark_message_read(service, gmail_msg_id)
-            except Exception as exc:
-                logger.warning(
-                    f"[gmail_sync] Failed to mark {gmail_msg_id} read: {exc}"
-                )
-
-            new_email_ids.append(
-                cast(int, email_obj.id)
-            )
-            new_count += 1
-
-            logger.info(
-                f"[gmail_sync] Saved email "
-                f"'{subject[:60]}' "
-                f"from {sender_email}"
-            )
-
-        except IntegrityError:
-            db_email.rollback()
-
-            try:
-                _mark_message_read(
-                    service,
-                    gmail_msg_id,
-                )
-            except Exception:
-                pass
-
-            logger.info(
-                f"[gmail_sync] Duplicate email skipped: "
-                f"{stored_message_id}"
-            )
-
-        except Exception as exc:
-            db_email.rollback()
-
-            logger.error(
-                f"[gmail_sync] Failed to save email "
-                f"{gmail_msg_id}: {exc}"
-            )
-
-        finally:
-            db_email.close()
-
-    # ---------------------------------------------------------
-    # Queue AI analysis
-    # ---------------------------------------------------------
-    _queue_analysis_if_enabled(new_email_ids, conversation_analysis_enabled)
-
-    status_db = SessionLocal()
+# ── Push notifications (users.watch) ──────────────────────────
+def ensure_gmail_watch(integration_id: int) -> bool:
+    """Start/renew the Gmail push subscription (expires after 7 days). Blocking."""
+    if not settings.GMAIL_PUBSUB_TOPIC:
+        return False
+    db = SessionLocal()
     try:
-        row = status_db.query(EmailIntegration).filter(EmailIntegration.id == integration_pk).first()
+        integration = db.query(EmailIntegration).filter(EmailIntegration.id == integration_id).first()
+        expires = integration.gmail_watch_expires_at if integration else None
+    finally:
+        db.close()
+    if expires and expires - datetime.now(timezone.utc) > timedelta(days=1):
+        return False
+
+    service = build_gmail_service(integration_id)
+    response = service.users().watch(userId="me", body={
+        "topicName": settings.GMAIL_PUBSUB_TOPIC,
+        "labelIds": ["INBOX"],
+        "labelFilterBehavior": "INCLUDE",
+    }).execute()
+    expiration = datetime.fromtimestamp(int(response["expiration"]) / 1000, tz=timezone.utc)
+    db = SessionLocal()
+    try:
+        row = db.query(EmailIntegration).filter(EmailIntegration.id == integration_id).first()
         if row:
-            status_row = cast(Any, row)
-            status_row.last_sync_at = datetime.now(timezone.utc)
-            if new_count:
-                status_row.last_email_processed_at = datetime.now(timezone.utc)
-            status_row.health_status = "healthy"
-            status_row.health_message = f"Fetched {new_count} new email(s)"
-            status_db.commit()
-    except Exception as exc:
-        logger.warning(f"[gmail_sync] Failed to update health status: {exc}")
-        status_db.rollback()
+            row.gmail_watch_expires_at = expiration
+            if not row.gmail_history_id:
+                row.gmail_history_id = str(response.get("historyId"))
+            db.commit()
     finally:
-        status_db.close()
-    return new_count
-
-
-def _send_domain_rejection(
-    service,
-    sender_addr: str,
-    my_addr: str,
-    subject: str,
-    thread_id: str | None,
-    message_id_header: str | None,
-):
-    """Send an auto-reply via Gmail API telling the sender they are not allowed."""
-    import email as _email_lib
-    from email.mime.text import MIMEText
-
-    body = (
-        f"Hello,\n\n"
-        f"Thank you for your email. Unfortunately your domain is not authorised to "
-        f"send messages to this mailbox, so your message could not be delivered.\n\n"
-        f"If you believe this is an error, please contact the mailbox administrator.\n\n"
-        f"This is an automated response — please do not reply to this message."
-    )
-    msg = MIMEText(body)
-    msg["To"]      = sender_addr
-    msg["From"]    = my_addr
-    msg["Subject"] = f"Re: {subject}"
-    if thread_id and message_id_header:
-        msg["In-Reply-To"] = message_id_header
-        msg["References"] = message_id_header
-
-    import base64 as _b64
-    raw = _b64.urlsafe_b64encode(msg.as_bytes()).decode()
-    send_body: dict = {"raw": raw}
-    if thread_id:
-        send_body["threadId"] = thread_id
-
-    try:
-        service.users().messages().send(userId="me", body=send_body).execute()
-        logger.info(
-            f"[gmail_sync] Domain rejection auto-reply sent to {sender_addr}"
-        )
-
-    except Exception as exc:
-        if "rateLimitExceeded" in str(exc):
-            logger.warning(
-                "[gmail_sync] Gmail send limit exceeded"
-            )
-        else:
-            logger.warning(
-                f"[gmail_sync] Failed to send domain rejection reply: {exc}"
-            )
-
-
-def _schedule_analysis(email_id):
-    """Fire-and-forget: queue the AI analysis pipeline for a newly saved email.
-
-    The semaphore ensures at most 3 pipelines run concurrently, keeping
-    DB connection usage well within pool limits.
-    The pipeline itself manages its own short-lived DB sessions.
-    """
-    from app.routers.emails import _run_analysis_pipeline
-
-    async def _run():
-        async with _analysis_semaphore:
-            try:
-                await _run_analysis_pipeline(email_id)
-            except Exception as exc:
-                logger.error(f"[gmail_sync] Analysis failed for email {email_id}: {exc}")
-
-    asyncio.create_task(_run())
-
-
-def _queue_analysis_if_enabled(email_ids: list[int], enabled: bool | None) -> None:
-    """Queue conversational analysis only when the mailbox has it enabled."""
-    if enabled is not False:
-        for email_id in email_ids:
-            _schedule_analysis(email_id)
+        db.close()
+    logger.info(f"[gmail_sync] Gmail watch active for integration {integration_id} until {expiration}")
+    return True
 
 
 # ── Sync all integrations ─────────────────────────────────────
-
 async def sync_all_gmail():
-    """Sync every active Gmail integration."""
+    """Sync every active Gmail integration (used by manual triggers and the in-process poller)."""
     db = SessionLocal()
     try:
         integration_ids = [
             cast(int, row.id)
-            for row in db.query(EmailIntegration).filter(
+            for row in db.query(EmailIntegration.id).filter(
                 EmailIntegration.is_active == True,
                 EmailIntegration.provider == "gmail",
             )
@@ -614,36 +336,30 @@ async def sync_all_gmail():
 
     total = 0
     for iid in integration_ids:
-        total += await sync_gmail_integration(cast(int, iid))
+        try:
+            total += await sync_gmail_integration(cast(int, iid))
+        except Exception as exc:
+            logger.exception(f"[gmail_sync] Integration {iid} sync failed: {exc}")
+            _update_health(iid, "error", f"Sync failed: {exc}")
 
     if total:
-        logger.info(f"[gmail_sync] Fetched {total} new email(s) across all integrations")
+        logger.info(f"[gmail_sync] Queued {total} new message(s) across all integrations")
 
 
-# ── Background poller ─────────────────────────────────────────
+# ── In-process scheduler (used when Redis/ARQ is unavailable) ─
 async def start_email_poller():
-    logger.info(
-        f"[gmail_sync] Email poller started — "
-        f"interval={settings.FETCH_INTERVAL_SECONDS}s"
-    )
+    """Fallback scheduler: runs the same periodic jobs the ARQ cron would."""
+    from app.jobs.tasks import run_periodic_maintenance, schedule_mailbox_syncs
 
+    logger.info(f"[gmail_sync] In-process poller started — interval={settings.FETCH_INTERVAL_SECONDS}s")
     try:
         while True:
             try:
-                await sync_all_gmail()
-                from app.services.document_intake.provider_sync import sync_all_document_providers
-                await sync_all_document_providers()
+                await schedule_mailbox_syncs(force=True)
+                await run_periodic_maintenance()
             except Exception as exc:
-                logger.error(
-                    f"[gmail_sync] Poller cycle failed: {exc}"
-                )
-
-            await asyncio.sleep(
-                settings.FETCH_INTERVAL_SECONDS
-            )
-
+                logger.error(f"[gmail_sync] Poller cycle failed: {exc}")
+            await asyncio.sleep(settings.FETCH_INTERVAL_SECONDS)
     except asyncio.CancelledError:
-        logger.info(
-            "[gmail_sync] Email poller stopped"
-        )
+        logger.info("[gmail_sync] Email poller stopped")
         raise

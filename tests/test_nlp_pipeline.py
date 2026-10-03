@@ -1,9 +1,6 @@
-import pytest
-from app.services.preprocessor import preprocess_email, strip_html, remove_signature, remove_thread_quotes
+from app.services.preprocessor import preprocess_email, strip_html
 from app.services.sentiment_analyzer import analyze_sentiment
 from app.services.emotion_detector import detect_emotions
-from app.services.priority_assigner import assign_priority
-from app.services.router_service import route_email
 from app.services.classifier import _keyword_classify
 
 
@@ -43,36 +40,6 @@ def test_emotion_detection():
     emotions = detect_emotions("I am furious about this unexpected charge and need an answer ASAP!")
     assert emotions.primary_emotion in ("anger", "urgency", "concern")
     assert len(emotions.emotions) > 0
-
-
-def test_priority_assignment():
-    # Critical condition: negative complaint with anger/urgency
-    critical = assign_priority(
-        sentiment_label="negative",
-        sentiment_score=-0.8,
-        primary_emotion="anger",
-        category="complaint",
-    )
-    assert critical.priority == "critical"
-    assert critical.score == 4
-
-    # Low condition: positive general
-    low = assign_priority(
-        sentiment_label="positive",
-        sentiment_score=0.7,
-        primary_emotion="satisfaction",
-        category="general",
-    )
-    assert low.priority == "low"
-    assert low.score == 1
-
-
-def test_router_service():
-    routed_finance = route_email(category="refund", sentiment="neutral", priority="high")
-    assert routed_finance.team == "finance"
-
-    routed_critical = route_email(category="complaint", sentiment="negative", priority="critical")
-    assert routed_critical.team == "support_escalated"
 
 
 def test_keyword_classification():

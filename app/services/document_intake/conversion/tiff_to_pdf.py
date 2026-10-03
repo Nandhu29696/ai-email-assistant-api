@@ -8,6 +8,9 @@ def convert_tiff_to_pdf(data: bytes) -> bytes:
     from PIL import Image, ImageSequence
 
     img = Image.open(io.BytesIO(data))
+    # Guard against decompression bombs (Pillow raises above its pixel limit).
+    if img.width * img.height > 200_000_000:
+        raise ValueError("TIFF image is too large to convert")
     pages = []
     for frame in ImageSequence.Iterator(img):
         pages.append(frame.convert("RGB"))

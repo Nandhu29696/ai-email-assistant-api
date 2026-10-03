@@ -1,18 +1,23 @@
 """
-Document Intake & Batch Processing Pipeline — SQLAlchemy models.
-See DOCUMENT_INTAKE_BATCH_PROCESSING_PLAN.md for full design (§3).
+Email intake models: one batch per inbound email, its attachments and its audit trail.
+
+Status flow:  RECEIVED -> PROCESSING -> SUCCESS | REJECTED | FAILED
+  REJECTED = a rule failed and the sender was told why (domain, no attachment,
+             unsupported type, unreadable/protected attachment).
+  FAILED   = a system problem (converter missing, storage error); the sender is
+             not blamed and an admin can reprocess the email.
 """
 from sqlalchemy import (
-    Column, String, Text, Boolean, DateTime, ForeignKey,
-    Integer, SmallInteger, JSON, Numeric, UniqueConstraint,
+    Column, String, Text, Boolean, ForeignKey,
+    Integer, JSON, Numeric, UniqueConstraint,
 )
 from sqlalchemy.orm import relationship
-from sqlalchemy.sql import func
-from app.database import Base
+from sqlalchemy.sql import func, false
+from app.database import Base, UTCDateTime
 
 
 class EmailBatch(Base):
-    """Parent table — one row per inbound document-intake email (§3.2)."""
+    """One row per inbound email."""
     __tablename__ = "email_batches"
     __table_args__ = (
         UniqueConstraint("integration_id", "message_id", name="uq_email_batches_integration_message"),
@@ -21,43 +26,47 @@ class EmailBatch(Base):
     id                = Column(Integer, primary_key=True, autoincrement=True)
     batch_no          = Column(String(60), unique=True, nullable=False, index=True)
     message_id        = Column(String(512), nullable=False, index=True)
-    conversation_id   = Column(String(512))
+    conversation_id   = Column(String(512))     # provider message id, used to re-fetch for reprocessing
     integration_id    = Column(Integer, ForeignKey("email_integrations.id", ondelete="SET NULL"), nullable=True)
-    mailbox_type      = Column(String(10))          # PROD | UAT | DEV
-    email_type        = Column(String(30), default="inbound_document")
+    mailbox_type      = Column(String(10))      # PROD | UAT | DEV
+    sender_name       = Column(String(255))
     sender_email      = Column(String(255), nullable=False)
     recipient_email   = Column(String(255))
     subject           = Column(Text)
-    received_datetime = Column(DateTime(timezone=True), nullable=False)
+    body_text         = Column(Text)
+    received_datetime = Column(UTCDateTime(), nullable=False)
     status            = Column(String(30), default="RECEIVED", index=True)
+    # Which rule decided the result, e.g. DOMAIN_NOT_ALLOWED, NO_ATTACHMENT, PROCESSED
+    outcome           = Column(String(40), index=True)
     status_reason     = Column(Text)
     attachment_count  = Column(Integer, default=0)
-    merged_pdf_path   = Column(Text)
+    email_pdf_path    = Column(Text)            # PDF of the email content (rule 5.2)
+    merged_pdf_path   = Column(Text)            # attachments + email PDF last (rule 5.3/5.4)
 
-    # AI analysis columns (§1.2.3)
-    sentiment          = Column(String(20))
+    # AI analysis, run for every email as soon as it is picked up
+    sentiment          = Column(String(20))     # positive | neutral | negative
     sentiment_score    = Column(Numeric(5, 4))
     primary_emotion    = Column(String(50))
     email_category     = Column(String(50))
-    sensitivity_level  = Column(String(20))    # public | internal | confidential | restricted
-    contains_pii       = Column(Boolean, default=False)
-    pii_types_json     = Column(JSON, default=list)
+    priority           = Column(String(20), index=True)   # critical | high | medium | low
+    ai_summary         = Column(Text)
     ai_model_version   = Column(String(50))
 
-    processed_at = Column(DateTime(timezone=True))
-    is_archived  = Column(Boolean, default=False, index=True)
-    archived_at  = Column(DateTime(timezone=True))
-    created_at   = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at   = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    processed_at = Column(UTCDateTime())
+    # Retention: after the mailbox's retention period the stored PDFs are deleted;
+    # the record, its timeline and attachment statuses are kept.
+    is_archived  = Column(Boolean, default=False, server_default=false(), index=True)
+    archived_at  = Column(UTCDateTime())
+    created_at   = Column(UTCDateTime(), server_default=func.now())
+    updated_at   = Column(UTCDateTime(), server_default=func.now(), onupdate=func.now())
 
     integration = relationship("EmailIntegration")
     events      = relationship("EmailBatchEvent", back_populates="batch", cascade="all, delete-orphan")
     attachments = relationship("EmailBatchAttachment", back_populates="batch", cascade="all, delete-orphan")
-    callbacks   = relationship("EmailBatchCallback", back_populates="batch", cascade="all, delete-orphan")
 
 
 class EmailBatchEvent(Base):
-    """Audit-log sub-table — one row per validation/processing event (§3.3)."""
+    """Audit trail — one row per step/decision/reply for an email."""
     __tablename__ = "email_batch_events"
 
     id               = Column(Integer, primary_key=True, autoincrement=True)
@@ -68,13 +77,13 @@ class EmailBatchEvent(Base):
     reply_sent       = Column(Boolean, default=False)
     reply_message_id = Column(String(512))
     details          = Column(JSON, default=dict)
-    created_at       = Column(DateTime(timezone=True), server_default=func.now())
+    created_at       = Column(UTCDateTime(), server_default=func.now())
 
     batch = relationship("EmailBatch", back_populates="events")
 
 
 class EmailBatchAttachment(Base):
-    """One row per attachment file in a batch (§3.4)."""
+    """One row per attachment of an email."""
     __tablename__ = "email_batch_attachments"
 
     id                     = Column(Integer, primary_key=True, autoincrement=True)
@@ -83,81 +92,41 @@ class EmailBatchAttachment(Base):
     batch_source_filename  = Column(String(255), nullable=False)
     doc_type               = Column(String(20))
     file_size_bytes        = Column(Integer)
-    received_date          = Column(DateTime(timezone=True))
+    received_date          = Column(UTCDateTime())
     is_encrypted           = Column(Boolean, default=False)
-    converted_pdf_path     = Column(Text)
+    converted_pdf_path     = Column(Text)       # this file as a PDF (rule 5.1)
     status                 = Column(String(20), default="PENDING")
-    # PENDING | CONVERTED | SKIPPED_ENCRYPTED | SKIPPED_INVALID_TYPE | FAILED | MERGED
+    # PENDING | INVALID_TYPE | PROTECTED | UNREADABLE | CONVERTED | MERGED | FAILED
     status_reason          = Column(Text)
-    created_at             = Column(DateTime(timezone=True), server_default=func.now())
+    created_at             = Column(UTCDateTime(), server_default=func.now())
 
     batch = relationship("EmailBatch", back_populates="attachments")
 
 
-class EmailBatchCallback(Base):
-    """Client webhook notification delivery log (§3.5)."""
-    __tablename__ = "email_batch_callbacks"
-
-    id                          = Column(Integer, primary_key=True, autoincrement=True)
-    parent_batch_id             = Column(Integer, ForeignKey("email_batches.id", ondelete="CASCADE"), nullable=False)
-    batch_no                    = Column(String(60), index=True)
-    process_result_status_code  = Column(String(20))
-    process_result_message      = Column(Text)
-    payload_json                = Column(JSON, default=dict)
-    webhook_url                 = Column(Text)
-    http_status_code            = Column(Integer)
-    attempt_no                  = Column(SmallInteger, default=1)
-    delivered                   = Column(Boolean, default=False)
-    error_detail                = Column(Text)
-    created_at                  = Column(DateTime(timezone=True), server_default=func.now())
-
-    batch = relationship("EmailBatch", back_populates="callbacks")
-
-
 class BatchSequence(Base):
-    """Concurrency-safe per-prefix/day sequence counter for batch numbering (open question §11.3 — resolved as DB row lock)."""
+    """Concurrency-safe per-prefix/day sequence counter for batch numbering."""
     __tablename__ = "batch_sequences"
 
     id            = Column(Integer, primary_key=True, autoincrement=True)
     sequence_key  = Column(String(80), unique=True, nullable=False, index=True)  # e.g. "CLM-PROD-20260905"
     last_value    = Column(Integer, nullable=False, default=0)
-    updated_at    = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    updated_at    = Column(UTCDateTime(), server_default=func.now(), onupdate=func.now())
 
 
 class EmailTemplate(Base):
-    """Branded/localized auto-reply templates (open question #1 — resolved as a dedicated table).
-
-    `integration_id=NULL` rows are global defaults used when no integration-specific
-    override exists for the given (template_key, locale) pair.
-    """
+    """Auto-reply text for each rule. ``integration_id=NULL`` rows are the global defaults."""
     __tablename__ = "email_templates"
 
-    id               = Column(Integer, primary_key=True, autoincrement=True)
-    integration_id   = Column(Integer, ForeignKey("email_integrations.id", ondelete="CASCADE"), nullable=True, index=True)
-    template_key      = Column(String(60), nullable=False, index=True)
-    # domain_rejected | no_attachment | invalid_file_type | encrypted_file | success | failure
-    locale            = Column(String(10), default="en")
-    subject_template  = Column(Text, nullable=False)
-    html_body_template = Column(Text, nullable=False)
-    signature_html    = Column(Text)
-    logo_url          = Column(Text)
-    is_active         = Column(Boolean, default=True)
-    created_at        = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at        = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
-
-    integration = relationship("EmailIntegration")
-
-
-class EmailTemplateVersion(Base):
-    """Immutable snapshot of an integration template before each update."""
-    __tablename__ = "email_template_versions"
-
     id                 = Column(Integer, primary_key=True, autoincrement=True)
-    template_id        = Column(Integer, ForeignKey("email_templates.id", ondelete="CASCADE"), nullable=False, index=True)
-    template_key       = Column(String(60), nullable=False)
+    integration_id     = Column(Integer, ForeignKey("email_integrations.id", ondelete="CASCADE"), nullable=True, index=True)
+    template_key       = Column(String(60), nullable=False, index=True)
+    locale             = Column(String(10), default="en")
     subject_template   = Column(Text, nullable=False)
     html_body_template = Column(Text, nullable=False)
     signature_html     = Column(Text)
     logo_url           = Column(Text)
-    created_by_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
-    created_at         = Column(DateTime(timezone=True), server_default=func.now())
+    is_active          = Column(Boolean, default=True)
+    created_at         = Column(UTCDateTime(), server_default=func.now())
+    updated_at         = Column(UTCDateTime(), server_default=func.now(), onupdate=func.now())
+
+    integration = relationship("EmailIntegration")
