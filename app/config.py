@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     ALLOWED_ORIGINS: list[str] = [
         "http://localhost:3000",
         "http://127.0.0.1:3000",
+        "http://187.127.166.46:3000",
     ]
 
     # ── Database – individual fields (read from .env) ─────────
