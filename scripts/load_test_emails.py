@@ -79,13 +79,10 @@ async def load() -> None:
 
 
 def cleanup() -> None:
+    """Remove the demo emails (wherever they were moved), their PDFs and the test mailbox. Real mailboxes are kept."""
     db = SessionLocal()
     try:
-        box = db.query(EmailIntegration).filter(EmailIntegration.email_address == TEST_MAILBOX).first()
-        if box is None:
-            print("Nothing to clean up.")
-            return
-        batches = db.query(EmailBatch).filter(EmailBatch.integration_id == box.id).all()
+        batches = db.query(EmailBatch).filter(EmailBatch.message_id.like(f"{MESSAGE_PREFIX}%")).all()
         paths = [p for b in batches for p in (b.merged_pdf_path, b.email_pdf_path) if p]
         paths += [p for (p,) in db.query(EmailBatchAttachment.converted_pdf_path).filter(
             EmailBatchAttachment.parent_batch_id.in_([b.id for b in batches] or [0])) if p]
@@ -96,9 +93,12 @@ def cleanup() -> None:
                 print(f"could not delete {path}: {exc}")
         for batch in batches:
             db.delete(batch)            # events and attachments cascade
-        db.delete(box)
+        box = db.query(EmailIntegration).filter(EmailIntegration.email_address == TEST_MAILBOX).first()
+        if box is not None:
+            db.delete(box)
         db.commit()
-        print(f"Removed {len(batches)} test email(s), {len(paths)} PDF file(s) and the test mailbox.")
+        print(f"Removed {len(batches)} demo email(s), {len(paths)} PDF file(s)"
+              f"{' and the test mailbox' if box is not None else ''}.")
     finally:
         db.close()
 

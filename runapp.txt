@@ -26,3 +26,10 @@ ruff check .
 # Production: see ../docker-compose.prod.yml and ../deploy/.env.production.example
 
 API doc: http://187.127.166.46:5000/docs#/
+
+
+
+Login credentials
+
+admin - KhICCXQH4sIDVdcR
+demo_client - mWQs5yBoMwajdh7a
