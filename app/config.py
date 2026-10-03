@@ -11,7 +11,7 @@ class Settings(BaseSettings):
     APP_VERSION: str = "1.0.0"
     DEBUG: bool = False
     ENVIRONMENT: str = "development"
-    FRONTEND_URL: str = "http://localhost:3000"
+    FRONTEND_URL: str = "http://187.127.166.46:3000"
     # Override in .env as a JSON list, e.g. ALLOWED_ORIGINS=["https://app.example.com"]
     ALLOWED_ORIGINS: list[str] = [
         "http://localhost:3000",
