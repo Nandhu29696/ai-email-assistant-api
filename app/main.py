@@ -87,6 +87,33 @@ async def security_headers(request, call_next):
     return response
 
 
+@app.middleware("http")
+async def json_errors(request: Request, call_next):
+    """Turn unhandled errors into JSON responses *inside* CORS.
+
+    Starlette's default 500 page is produced outside every middleware, so it has
+    no CORS headers and the browser reports a misleading "blocked by CORS policy"
+    instead of the real error. A lost database connection becomes a clear 503.
+    """
+    from fastapi.responses import JSONResponse
+    from sqlalchemy.exc import DBAPIError, OperationalError
+
+    try:
+        return await call_next(request)
+    except (OperationalError, DBAPIError) as exc:
+        if isinstance(exc, DBAPIError) and not getattr(exc, "connection_invalidated", False) and not isinstance(exc, OperationalError):
+            logger.exception(f"Database error on {request.method} {request.url.path}: {exc}")
+            return JSONResponse({"detail": "Internal server error"}, status_code=500)
+        logger.error(f"Database unavailable on {request.method} {request.url.path}: {exc.orig if hasattr(exc, 'orig') else exc}")
+        return JSONResponse(
+            {"detail": "The database is unavailable. Please try again shortly or contact the administrator."},
+            status_code=503,
+        )
+    except Exception as exc:
+        logger.exception(f"Unhandled error on {request.method} {request.url.path}: {exc}")
+        return JSONResponse({"detail": "Internal server error"}, status_code=500)
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.ALLOWED_ORIGINS,
