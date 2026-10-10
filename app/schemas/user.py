@@ -31,6 +31,8 @@ class UserOut(BaseModel):
     full_name: Optional[str]
     role: str
     is_active: bool
+    client_id: Optional[int] = None
+    client_name: Optional[str] = None
     mfa_enabled: bool = False
     last_login_at: Optional[datetime] = None
     created_at: Optional[datetime] = None

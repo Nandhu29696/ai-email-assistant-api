@@ -351,15 +351,19 @@ async def start_email_poller():
     """Fallback scheduler: runs the same periodic jobs the ARQ cron would."""
     from app.jobs.tasks import run_periodic_maintenance, schedule_mailbox_syncs
 
-    logger.info(f"[gmail_sync] In-process poller started — interval={settings.FETCH_INTERVAL_SECONDS}s")
+    from app.models.email import MIN_FETCH_INTERVAL_SECONDS
+
+    logger.info(f"[gmail_sync] In-process poller started — default interval={settings.FETCH_INTERVAL_SECONDS}s "
+                "(each mailbox can set its own)")
     try:
         while True:
             try:
-                await schedule_mailbox_syncs(force=True)
+                # Each mailbox is synced only once its own pickup interval has passed.
+                await schedule_mailbox_syncs()
                 await run_periodic_maintenance()
             except Exception as exc:
                 logger.error(f"[gmail_sync] Poller cycle failed: {exc}")
-            await asyncio.sleep(settings.FETCH_INTERVAL_SECONDS)
+            await asyncio.sleep(MIN_FETCH_INTERVAL_SECONDS)
     except asyncio.CancelledError:
         logger.info("[gmail_sync] Email poller stopped")
         raise

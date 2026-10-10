@@ -1,8 +1,7 @@
 """
 Email intake pipeline — the one flow every new email goes through.
 
-  0. Picked up automatically (mailbox sync job) and analysed: category, sentiment, emotion,
-     priority and a short AI summary.
+  0. Picked up automatically (mailbox sync job).
      Machine-sent mail (bounces, out-of-office, newsletters) is recorded and ignored;
      forged senders (SPF/DKIM/DMARC failure) are rejected without a reply.
   1. Sender domain not allowed      -> reply "domain not valid"             -> REJECTED
@@ -12,7 +11,8 @@ Email intake pipeline — the one flow every new email goes through.
                                     -> reply listing those files            -> REJECTED
   4. Every attachment is opened; password-protected, encrypted or unreadable files
                                     -> reply listing those files            -> REJECTED
-  5. Valid attachments: each converted to PDF and stored (5.1), the email content
+  5. Valid attachments: the email is analysed (category, sentiment, emotion, priority,
+     summary — only emails that passed every rule), each attachment converted to PDF and stored (5.1), the email content
      rendered as a PDF (5.2), everything merged with the email PDF last (5.3),
      the merged PDF stored and a success reply listing the attachments sent (5.4)
                                     -> SUCCESS (5.5)
@@ -159,6 +159,8 @@ def _storage_folder(integration: EmailIntegration, batch: EmailBatch) -> str:
 
 
 # ── Replies ───────────────────────────────────────────────────
+MAX_STORED_REPLY_CHARS = 20_000
+
 def _send_rendered(service, ctx: IntakeEmailContext, subject: str, html_body: str) -> bool:
     """Blocking send of a rendered HTML auto-reply via the provider (in the same thread)."""
     if hasattr(service, "send_reply"):
@@ -197,8 +199,8 @@ async def _reply(
     context: dict | None = None,
     details: dict | None = None,
 ) -> bool:
-    """Render a rule's template, send it in the sender's thread and log the event."""
-    sent, error = False, None
+    """Render a rule's template, send it in the sender's thread and log the event (with what was sent)."""
+    sent, error, rendered = False, None, None
     try:
         rendered = render_template(
             db, template_key,
@@ -217,6 +219,11 @@ async def _reply(
         logger.warning(f"[intake] {template_key} reply to {ctx.sender_email} failed: {error}")
     event_details = dict(details or {})
     event_details["template"] = template_key
+    event_details["reply_to"] = ctx.sender_email
+    if rendered is not None:
+        # Kept so the email's details can show exactly what the sender received.
+        event_details["reply_subject"] = rendered.subject[:500]
+        event_details["reply_html"] = rendered.html_body[:MAX_STORED_REPLY_CHARS]
     if error:
         event_details["reply_error"] = error
     _log_event(db, batch, event_type, details=event_details, reply_sent=sent)
@@ -433,9 +440,6 @@ async def _run_rules(
     batch.status_reason = "Processing"
     db.commit()
 
-    # ── 0. Categorise + sentiment, for every email ──────────
-    await _analyse(db, batch, ctx)
-
     if is_automated_message(ctx.headers, ctx.sender_email):
         _log_event(db, batch, "AUTOMATED_MESSAGE_IGNORED")
         return _finish(db, batch, IGNORED, "AUTOMATED_MESSAGE",
@@ -545,6 +549,11 @@ async def _run_rules(
                      {"files": [name for name, _ in invalid]})
         return _finish(db, batch, REJECTED, "INVALID_ATTACHMENTS",
                        "Attachment(s) protected or unreadable: " + ", ".join(name for name, _ in invalid))
+
+    # ── AI analysis: only for emails that passed every rule ──
+    # Ignored and rejected emails are not analysed. The summary is ready in
+    # time to be printed on the email-content PDF (5.2).
+    await _analyse(db, batch, ctx)
 
     # ── 5. Convert -> store -> email PDF -> merge -> store ──
     adapter = get_storage_adapter()

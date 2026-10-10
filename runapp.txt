@@ -3,7 +3,7 @@
 #    Databases managed by Alembic:   alembic upgrade head
 
 # 2. API — this also picks up new mail automatically (RUN_BACKGROUND_WORKERS=true, the default).
-uvicorn app.main:app --port 5000 --reload
+uvicorn app.main:app --port 8002 --reload
 
 # 3. Frontend (in ../frontend) — after a code change: npx next build, then restart:
 #    npx next start -p 3000
@@ -14,7 +14,7 @@ uvicorn app.main:app --port 5000 --reload
 # python -m app.worker
 
 # Tests (use a throwaway database — never the one in .env):
-pip install -r requirements-dev.txt
+pip install -r requirements.txt
 python -m pytest                                  # quick run on SQLite
 # TEST_DATABASE_URLS="postgresql+psycopg2://u:p@localhost/test_db,mysql+pymysql://u:p@localhost/test_db" python -m pytest
 ruff check .

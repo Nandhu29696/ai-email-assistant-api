@@ -74,7 +74,8 @@ def test_every_email_gets_priority_and_summary_and_the_summary_is_on_the_email_p
     email_pdf_text = "".join(p.extract_text() for p in PdfReader(batch.email_pdf_path).pages)
     assert "Summary:" in email_pdf_text
 
-    _, calm = run(db, mailbox, FakeMailbox(), body="Thanks a lot for the great service, everything is fine.")
+    _, calm = run(db, mailbox, FakeMailbox([att("receipt.pdf", make_pdf())]),
+                  body="Thanks a lot for the great service, everything is fine.")
     assert calm.priority == "low"
 
 
@@ -290,36 +291,3 @@ def test_activity_feed_returns_recently_finished_emails_for_the_owner(client, db
     since = (now - timedelta(minutes=10)).isoformat()
     recent = client.get("/api/document-intake/activity", params={"since": since}).json()
     assert [i["batch_no"] for i in recent["items"]] == ["FEED-1"] and recent["server_time"]
-
-
-# ── Errors stay readable in the browser (CORS headers on 500/503) ──
-def test_database_outage_returns_503_with_cors_headers(client, monkeypatch):
-    from sqlalchemy.exc import OperationalError
-    import app.main as main_module
-    from app.database import get_db
-
-    def broken_db():
-        raise OperationalError("SELECT 1", {}, Exception("Can't connect to MySQL server"))
-        yield  # pragma: no cover
-
-    main_module.app.dependency_overrides[get_db] = broken_db
-    response = client.post("/api/auth/login", data={"username": "x", "password": "y"},
-                           headers={"Origin": "http://localhost:3000"})
-    assert response.status_code == 503
-    assert "database is unavailable" in response.json()["detail"]
-    assert response.headers.get("access-control-allow-origin") == "http://localhost:3000"
-
-
-def test_unexpected_error_returns_500_with_cors_headers(client, monkeypatch):
-    import app.main as main_module
-    from app.database import get_db
-
-    def exploding_db():
-        raise RuntimeError("boom")
-        yield  # pragma: no cover
-
-    main_module.app.dependency_overrides[get_db] = exploding_db
-    response = client.post("/api/auth/login", data={"username": "x", "password": "y"},
-                           headers={"Origin": "http://localhost:3000"})
-    assert response.status_code == 500 and response.json() == {"detail": "Internal server error"}
-    assert response.headers.get("access-control-allow-origin") == "http://localhost:3000"

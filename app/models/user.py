@@ -13,7 +13,9 @@ class User(Base):
     username            = Column(String(100), unique=True, nullable=False, index=True)
     full_name           = Column(String(255))
     hashed_password     = Column(String(255), nullable=False)
-    role                = Column(String(20), nullable=False, default="client")
+    role                = Column(String(20), nullable=False, default="client")   # admin | client | user
+    # For role "user": the client account this login belongs to.
+    client_id           = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), index=True)
     is_active           = Column(Boolean, default=True)
     last_login_at       = Column(UTCDateTime())
     failed_login_count  = Column(Integer, default=0)
@@ -27,6 +29,20 @@ class User(Base):
 
     sessions   = relationship("UserSession", back_populates="user", cascade="all, delete-orphan")
     audit_logs = relationship("AuditLog",    back_populates="user", cascade="all, delete-orphan")
+    client     = relationship("User", remote_side=[id], foreign_keys=[client_id])
+
+    @property
+    def can_sign_in(self) -> bool:
+        """Active, and for a user: its client account is active too."""
+        if not self.is_active:
+            return False
+        if self.role == "user":
+            return self.client is not None and bool(self.client.is_active) and self.client.role == "client"
+        return True
+
+    @property
+    def client_name(self) -> str | None:
+        return (self.client.full_name or self.client.username) if self.client is not None else None
 
 
 class UserSession(Base):

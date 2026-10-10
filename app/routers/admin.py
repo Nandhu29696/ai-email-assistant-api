@@ -15,7 +15,7 @@ from app.models.user import User, UserSession, AuditLog
 from app.models.document_intake import EmailBatch, EmailBatchEvent
 from app.routers.auth import (
     require_admin, hash_password, _log_audit, _get_ip,
-    validate_password_strength, VALID_ROLES,
+    validate_password_strength, VALID_ROLES, _valid_client_id,
 )
 from app.schemas.user import UserOut
 
@@ -26,6 +26,7 @@ class UserUpdateRequest(BaseModel):
     full_name: Optional[str] = None
     email: Optional[EmailStr] = None
     role: Optional[str] = None
+    client_id: Optional[int] = None   # for role "user": the client it belongs to
     is_active: Optional[bool] = None
     new_password: Optional[str] = None
     reset_mfa: Optional[bool] = None   # admin recovery for a lost authenticator device
@@ -46,6 +47,7 @@ def list_users(
     admin: User = Depends(require_admin),
     search: Optional[str] = Query(None),
     role: Optional[str] = Query(None),
+    client_id: Optional[int] = Query(None, description="Only the users of this client"),
     is_active: Optional[bool] = Query(None),
     limit: int = Query(200, ge=1, le=500),
     offset: int = Query(0, ge=0),
@@ -59,6 +61,8 @@ def list_users(
         )
     if role:
         q = q.filter(User.role == role)
+    if client_id is not None:
+        q = q.filter(User.client_id == client_id)
     if is_active is not None:
         q = q.filter(User.is_active == is_active)
     return q.order_by(User.created_at.desc()).offset(offset).limit(limit).all()
@@ -109,14 +113,28 @@ def update_user(
             raise HTTPException(status_code=409, detail="Email already in use")
         user.email = payload.email
         changes["email"] = payload.email
-    if payload.role is not None:
-        if payload.role not in VALID_ROLES:
-            raise HTTPException(status_code=422, detail="Role must be admin or client")
-        user.role = payload.role
-        changes["role"] = payload.role
+    new_role = payload.role if payload.role is not None else user.role
+    if payload.role is not None and payload.role not in VALID_ROLES:
+        raise HTTPException(status_code=422, detail="Role must be admin, client or user")
+    if user.role == "client" and new_role != "client" and db.query(User.id).filter(User.client_id == user.id).first():
+        raise HTTPException(status_code=400, detail="This client still has users — move or deactivate them first")
+    if payload.role is not None or payload.client_id is not None:
+        client_id = _valid_client_id(db, new_role, payload.client_id if payload.client_id is not None else user.client_id)
+        if client_id == user.id:
+            raise HTTPException(status_code=422, detail="A user cannot belong to itself")
+        if user.client_id != client_id:
+            user.client_id = changes["client_id"] = client_id
+        if user.role != new_role:
+            user.role = changes["role"] = new_role
     if payload.is_active is not None:
         user.is_active = payload.is_active
         changes["is_active"] = payload.is_active
+        if not payload.is_active and user.role == "client":
+            # Its users can no longer sign in either; end their sessions now.
+            member_ids = [row.id for row in db.query(User.id).filter(User.client_id == user.id)]
+            if member_ids:
+                db.query(UserSession).filter(UserSession.user_id.in_(member_ids), UserSession.is_active == True).update(
+                    {"is_active": False, "revoked_at": datetime.now(timezone.utc)}, synchronize_session=False)
     if payload.new_password:
         validate_password_strength(payload.new_password)
         user.hashed_password = hash_password(payload.new_password)
@@ -155,11 +173,13 @@ def delete_user(
     if user.role == "admin" and user.is_active and _active_admin_count(db, exclude_user_id=user.id) == 0:
         raise HTTPException(status_code=400, detail="At least one active admin must remain")
 
-    # Soft-delete: deactivate instead of hard delete to preserve audit trail
+    # Soft-delete: deactivate instead of hard delete to preserve audit trail.
+    # A client's users lose access with it.
     user.is_active = False
+    affected = [user_id] + ([row.id for row in db.query(User.id).filter(User.client_id == user.id)] if user.role == "client" else [])
     db.query(UserSession).filter(
-        UserSession.user_id == user_id, UserSession.is_active == True
-    ).update({"is_active": False, "revoked_at": datetime.now(timezone.utc)})
+        UserSession.user_id.in_(affected), UserSession.is_active == True
+    ).update({"is_active": False, "revoked_at": datetime.now(timezone.utc)}, synchronize_session=False)
     db.commit()
     _log_audit(db, "user_deactivated", admin.id, "user", user_id,
                _get_ip(request), request.headers.get("User-Agent", ""),

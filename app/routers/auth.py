@@ -25,6 +25,7 @@ from pydantic import BaseModel, EmailStr
 
 from app.database import get_db
 from app.models.user import User, UserSession, AuditLog
+from app.access import ROLES
 from app.config import settings
 from app.schemas.user import TokenResponse, UserOut
 from app.services import mfa as totp
@@ -46,7 +47,7 @@ MAX_FAILED_ATTEMPTS = 5
 LOCKOUT_MINUTES     = 15
 REFRESH_TOKEN_DAYS  = 7
 MAX_SESSIONS_PER_USER = 10
-VALID_ROLES = ("admin", "client")
+VALID_ROLES = ROLES   # admin → client → user
 
 # Pre-computed hash so unknown usernames cost the same bcrypt time as real ones.
 _DUMMY_PASSWORD_HASH = bcrypt.hashpw(b"timing-equaliser", bcrypt.gensalt()).decode("utf-8")
@@ -196,7 +197,7 @@ def _user_from_access_token(token: str, db: Session) -> User:
         raise credentials_exception
 
     user = db.query(User).filter(User.id == user_id).first()
-    if user is None or not user.is_active:
+    if user is None or not user.can_sign_in:
         raise credentials_exception
 
     now = datetime.now(timezone.utc)
@@ -231,6 +232,17 @@ def get_current_user(
     return _user_from_access_token(token, db)
 
 
+def _valid_client_id(db: Session, role: str, client_id: int | None) -> int | None:
+    """A "user" must belong to an active client; other roles have no client."""
+    if role != "user":
+        return None
+    if client_id is None or not db.query(User.id).filter(
+        User.id == client_id, User.role == "client", User.is_active == True  # noqa: E712
+    ).first():
+        raise HTTPException(status_code=422, detail="A user must belong to an active client (client_id)")
+    return client_id
+
+
 def require_admin(current_user: User = Depends(get_current_user)) -> User:
     if current_user.role != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
@@ -243,6 +255,7 @@ class RegisterRequest(BaseModel):
     full_name: str | None = None
     password: str
     role: str = "client"
+    client_id: int | None = None   # required when role is "user"
 
 
 class RefreshRequest(BaseModel):
@@ -355,7 +368,7 @@ def login(
         _record_failed_attempt(db, user, now, ip, ua, "password")
         raise invalid
 
-    if not user.is_active:
+    if not user.can_sign_in:
         raise invalid
 
     if user.mfa_enabled:
@@ -394,7 +407,7 @@ def mfa_verify(
         raise HTTPException(status_code=401, detail="MFA session expired — please sign in again")
 
     user = db.query(User).filter(User.id == user_id, User.is_active == True).first()
-    if not user or not user.mfa_enabled or not user.mfa_secret:
+    if not user or not user.can_sign_in or not user.mfa_enabled or not user.mfa_secret:
         raise HTTPException(status_code=401, detail="MFA session expired — please sign in again")
     _check_not_locked(db, user, now)
 
@@ -442,7 +455,7 @@ def refresh_token_endpoint(
         raise HTTPException(status_code=401, detail="Invalid or expired refresh token")
 
     user = db.query(User).filter(User.id == session.user_id).first()
-    if not user or not user.is_active:
+    if not user or not user.can_sign_in:
         raise HTTPException(status_code=401, detail="User not found or disabled")
 
     new_refresh = create_refresh_token()
@@ -507,14 +520,15 @@ def register(
     if db.query(User).filter(User.email == payload.email).first():
         raise HTTPException(status_code=409, detail="Email already registered")
     if payload.role not in VALID_ROLES:
-        raise HTTPException(status_code=422, detail="role must be 'admin' or 'client'")
+        raise HTTPException(status_code=422, detail="role must be 'admin', 'client' or 'user'")
+    client_id = _valid_client_id(db, payload.role, payload.client_id)
     validate_password_strength(payload.password)
 
     user = User(
         username=payload.username, email=payload.email,
         full_name=payload.full_name,
         hashed_password=hash_password(payload.password),
-        role=payload.role,
+        role=payload.role, client_id=client_id,
     )
     db.add(user)
     db.commit()

@@ -99,3 +99,12 @@ def pytest_sessionfinish(session, exitstatus):
             os.remove(_SQLITE_PATH)
     except OSError:
         pass
+
+
+@pytest.fixture(autouse=True)
+def _reset_login_rate_limit():
+    """Each test starts with a clean per-IP login limiter (it is in-process state)."""
+    from app.routers.auth import _login_attempts
+    _login_attempts.clear()
+    yield
+    _login_attempts.clear()

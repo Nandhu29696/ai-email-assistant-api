@@ -27,6 +27,7 @@ from app.schemas.email import IntegrationOut
 from app.config import settings
 from app.utils.crypto import encrypt_token
 from app.jobs.queue import enqueue
+from app.access import owner_for_new_mailbox, owns, scope_mailboxes
 from app.routers.auth import get_current_user, require_admin
 
 router = APIRouter()
@@ -204,7 +205,7 @@ def create_outlook_subscription(
     integration = db.query(EmailIntegration).filter(EmailIntegration.id == integration_id).first()
     if not integration or integration.provider != "outlook":
         raise HTTPException(status_code=404, detail="Outlook integration not found")
-    if current_user.role != "admin" and integration.owner_user_id != current_user.id:
+    if not owns(current_user, integration):
         raise HTTPException(status_code=403, detail="You can only manage your own integration")
     from app.services.document_intake.provider_adapters import OutlookGraphAdapter
     try:
@@ -250,10 +251,12 @@ async def create_imap_integration(
     """Connect an IMAP/SMTP mailbox. The IMAP login is verified before saving."""
     from app.services.email_fetcher import IMAPFetcher
 
-    owner_id = current_user.id
+    owner_id = owner_for_new_mailbox(current_user)
     if payload.owner_user_id is not None:
         if current_user.role != "admin":
             raise HTTPException(status_code=403, detail="Only admins can assign integration ownership")
+        if not db.query(User.id).filter(User.id == payload.owner_user_id, User.is_active == True, User.role != "user").first():
+            raise HTTPException(status_code=422, detail="owner_user_id must reference an active client or admin")
         owner_id = payload.owner_user_id
     if db.query(EmailIntegration.id).filter(EmailIntegration.email_address == payload.email_address).first():
         raise HTTPException(status_code=409, detail="This mailbox is already connected")
@@ -300,8 +303,7 @@ def list_integrations(
     current_user: User = Depends(get_current_user),
 ):
     query = db.query(EmailIntegration).filter(EmailIntegration.is_active == True)
-    if current_user.role != "admin":
-        query = query.filter(EmailIntegration.owner_user_id == current_user.id)
+    query = scope_mailboxes(query, current_user)
     return query.order_by(EmailIntegration.created_at.desc()).all()
 
 
@@ -309,7 +311,7 @@ def _owned_integration(db: Session, integration_id: int, current_user: User) -> 
     integration = db.query(EmailIntegration).filter(EmailIntegration.id == integration_id).first()
     if not integration:
         raise HTTPException(status_code=404, detail="Integration not found")
-    if current_user.role != "admin" and integration.owner_user_id != current_user.id:
+    if not owns(current_user, integration):
         raise HTTPException(status_code=403, detail="You can only manage your own integration")
     return integration
 
@@ -400,6 +402,8 @@ def gmail_callback(
         user_info = service.userinfo().get().execute()
         email_address = user_info["email"]
 
+        connecting_user = db.get(User, oauth_user_id)
+        oauth_user_id = owner_for_new_mailbox(connecting_user) if connecting_user else oauth_user_id
         integration = (
             db.query(EmailIntegration)
             .filter(EmailIntegration.email_address == email_address)
@@ -514,6 +518,8 @@ def outlook_callback(
         if not email_address:
             return _frontend_redirect("/mailboxes", error="no_mailbox_address")
 
+        connecting_user = db.get(User, oauth_user_id)
+        oauth_user_id = owner_for_new_mailbox(connecting_user) if connecting_user else oauth_user_id
         integration = (
             db.query(EmailIntegration)
             .filter(EmailIntegration.email_address == email_address)
@@ -567,7 +573,7 @@ def disconnect_integration(
     ).first()
     if not integration:
         raise HTTPException(status_code=404, detail="Integration not found")
-    if current_user.role != "admin" and integration.owner_user_id != current_user.id:
+    if not owns(current_user, integration):
         raise HTTPException(status_code=403, detail="You can only manage your own integration")
     integration.is_active     = False
     integration.access_token  = None
@@ -587,6 +593,8 @@ class IntegrationSettingsUpdate(BaseModel):
     max_file_size_mb: Optional[int] = Field(None, ge=1, le=100)
     allowed_sender_domains: Optional[str] = Field(None, max_length=5000)
     retention_days: Optional[int] = Field(None, ge=1, le=3650)
+    # Seconds between checks for new email; null = global default.
+    fetch_interval_seconds: Optional[int] = Field(None, ge=15, le=3600)
     owner_user_id: Optional[int] = None
 
     @field_validator("allowed_sender_domains")
@@ -629,9 +637,9 @@ def update_integration_settings(
     if payload.owner_user_id is not None and current_user.role != "admin":
         raise HTTPException(status_code=403, detail="Only admins can assign mailbox ownership")
     if payload.owner_user_id is not None and not db.query(User.id).filter(
-        User.id == payload.owner_user_id, User.is_active == True
+        User.id == payload.owner_user_id, User.is_active == True, User.role != "user"
     ).first():
-        raise HTTPException(status_code=422, detail="owner_user_id must reference an active user")
+        raise HTTPException(status_code=422, detail="owner_user_id must reference an active client or admin")
 
     for field_name, value in payload.model_dump(exclude_unset=True).items():
         setattr(integration, field_name, value)

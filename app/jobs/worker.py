@@ -23,7 +23,8 @@ class WorkerSettings:
         for name, runner in REGISTRY.items()
     ]
     cron_jobs = [
-        cron(tasks.cron_schedule_syncs, second={0, 30}, run_at_startup=True, unique=True),
+        # Every 15 s; each mailbox is only synced once its own pickup interval has passed.
+        cron(tasks.cron_schedule_syncs, second={0, 15, 30, 45}, run_at_startup=True, unique=True),
         cron(tasks.cron_renew_push, minute=7, second=0, run_at_startup=True, unique=True),
         cron(tasks.cron_retention, hour=2, minute=17, second=0, unique=True),
     ]

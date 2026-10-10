@@ -9,7 +9,7 @@ from loguru import logger
 from app.config import settings
 from app.database import SessionLocal
 from app.jobs.queue import enqueue, job
-from app.models.email import EmailIntegration
+from app.models.email import EmailIntegration, effective_fetch_interval
 
 
 # ── Mailbox sync ──────────────────────────────────────────────
@@ -58,19 +58,19 @@ async def reprocess_batch(batch_id: int) -> str:
 
 # ── Periodic work ─────────────────────────────────────────────
 async def schedule_mailbox_syncs(force: bool = False) -> int:
-    """Queue a sync for each active mailbox whose interval has elapsed (idempotent per mailbox)."""
+    """Queue a sync for each active mailbox whose own pickup interval has elapsed (idempotent per mailbox)."""
     now = datetime.now(timezone.utc)
-    interval = timedelta(seconds=max(30, settings.FETCH_INTERVAL_SECONDS))
     db = SessionLocal()
     try:
-        rows = db.query(EmailIntegration.id, EmailIntegration.last_sync_at).filter(
+        rows = db.query(EmailIntegration.id, EmailIntegration.last_sync_at, EmailIntegration.fetch_interval_seconds).filter(
             EmailIntegration.is_active == True,
             EmailIntegration.access_token.isnot(None) | (EmailIntegration.provider == "imap"),
         ).all()
     finally:
         db.close()
     queued = 0
-    for integration_id, last_sync_at in rows:
+    for integration_id, last_sync_at, own_interval in rows:
+        interval = timedelta(seconds=effective_fetch_interval(own_interval))
         if force or last_sync_at is None or now - last_sync_at >= interval - timedelta(seconds=5):
             if await enqueue("sync_mailbox", integration_id, job_id=f"sync:{integration_id}") != "duplicate":
                 queued += 1

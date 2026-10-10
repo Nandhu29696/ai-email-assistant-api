@@ -12,28 +12,30 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import Response
 from loguru import logger
 from pydantic import BaseModel, Field, field_validator
-from sqlalchemy import or_
-from sqlalchemy.orm import Session
+from sqlalchemy import func, or_
+from sqlalchemy.orm import Session, joinedload
 
 from app.database import get_db
 from app.models.document_intake import EmailBatch, EmailBatchAttachment, EmailBatchEvent, EmailTemplate
 from app.models.email import EmailIntegration
 from app.models.user import User
+from app.access import owns, scope_mailboxes
 from app.routers.auth import get_current_user, require_admin
 from app.services.document_intake.storage.factory import get_adapter_for_path
 from app.services.document_intake.template_renderer import (
     DEFAULT_TEMPLATES, PLACEHOLDERS, TEMPLATE_LABELS, render_template,
 )
+from app.services.email_agent import draft_reply
 
 router = APIRouter()
 
+IN_PROGRESS_STATUSES = ("RECEIVED", "PROCESSING", "REPROCESSING")
+
 
 def _scoped_batch_query(db: Session, current_user: User):
-    query = db.query(EmailBatch)
+    query = db.query(EmailBatch).options(joinedload(EmailBatch.integration))
     if current_user.role != "admin":
-        query = query.join(EmailIntegration, EmailBatch.integration_id == EmailIntegration.id).filter(
-            EmailIntegration.owner_user_id == current_user.id
-        )
+        query = scope_mailboxes(query.join(EmailIntegration, EmailBatch.integration_id == EmailIntegration.id), current_user)
     return query
 
 
@@ -48,6 +50,10 @@ def _batch_summary(b: EmailBatch) -> dict:
         "sender_name": b.sender_name,
         "sender_email": b.sender_email,
         "recipient_email": b.recipient_email,
+        # The mailbox that received the email (the "To" address can be an alias or a group).
+        "integration_id": b.integration_id,
+        "mailbox_email": b.integration.email_address if b.integration else b.recipient_email,
+        "mailbox_provider": b.integration.provider if b.integration else None,
         "subject": b.subject,
         "status": b.status,
         "outcome": b.outcome,
@@ -77,6 +83,8 @@ def list_batches(
     category: Optional[str] = Query(None),
     sentiment: Optional[str] = Query(None),
     priority: Optional[str] = Query(None),
+    integration_id: Optional[int] = Query(None, description="Only emails received by this mailbox"),
+    mailbox_type: Optional[str] = Query(None, pattern=r"^(PROD|UAT|DEV)$", description="Only emails received while the mailbox was PROD/UAT/DEV"),
     search: Optional[str] = Query(None, max_length=200),
     days: int = Query(30, ge=1, le=365),
     page: int = Query(1, ge=1),
@@ -84,8 +92,6 @@ def list_batches(
 ):
     since = datetime.now(timezone.utc) - timedelta(days=days)
     q = _scoped_batch_query(db, current_user).filter(EmailBatch.received_datetime >= since)
-    if status:
-        q = q.filter(EmailBatch.status == status)
     if outcome:
         q = q.filter(EmailBatch.outcome == outcome)
     if category:
@@ -94,6 +100,10 @@ def list_batches(
         q = q.filter(EmailBatch.sentiment == sentiment)
     if priority:
         q = q.filter(EmailBatch.priority == priority)
+    if integration_id is not None:
+        q = q.filter(EmailBatch.integration_id == integration_id)
+    if mailbox_type:
+        q = q.filter(EmailBatch.mailbox_type == mailbox_type)
     if search:
         needle = f"%{search.strip()}%"
         q = q.filter(or_(
@@ -102,6 +112,19 @@ def list_batches(
             EmailBatch.subject.ilike(needle),
         ))
 
+    # Counts per status tab, for every other filter applied (so the tabs show what each would list).
+    by_status = dict(q.enable_eagerloads(False).with_entities(EmailBatch.status, func.count(EmailBatch.id)).order_by(None)
+                     .group_by(EmailBatch.status).all())
+    status_counts = {
+        "ALL": sum(by_status.values()),
+        **{s: by_status.get(s, 0) for s in ("SUCCESS", "REJECTED", "FAILED", "IGNORED")},
+        "IN_PROGRESS": sum(by_status.get(s, 0) for s in IN_PROGRESS_STATUSES),
+    }
+    if status == "IN_PROGRESS":
+        q = q.filter(EmailBatch.status.in_(IN_PROGRESS_STATUSES))
+    elif status:
+        q = q.filter(EmailBatch.status == status)
+
     total = q.count()
     items = (
         q.order_by(EmailBatch.received_datetime.desc())
@@ -109,18 +132,22 @@ def list_batches(
         .limit(page_size)
         .all()
     )
-    return {"total": total, "page": page, "page_size": page_size, "items": [_batch_summary(b) for b in items]}
+    return {"total": total, "page": page, "page_size": page_size, "status_counts": status_counts,
+            "items": [_batch_summary(b) for b in items]}
 
 
 @router.get("/activity")
 def recent_activity(
     since: Optional[datetime] = Query(None, description="Only emails finished after this time (ISO 8601)"),
     limit: int = Query(20, ge=1, le=50),
+    integration_id: Optional[int] = Query(None, description="Only emails received by this mailbox"),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """Emails that finished processing recently, newest first — drives the notification pop-ups."""
     q = _scoped_batch_query(db, current_user).filter(EmailBatch.processed_at.isnot(None))
+    if integration_id is not None:
+        q = q.filter(EmailBatch.integration_id == integration_id)
     if since is not None:
         q = q.filter(EmailBatch.processed_at > (since if since.tzinfo else since.replace(tzinfo=timezone.utc)))
     items = q.order_by(EmailBatch.processed_at.desc()).limit(limit).all()
@@ -179,6 +206,48 @@ def get_batch_detail(batch_no: str, db: Session = Depends(get_db), current_user:
             for a in attachments
         ],
     }
+
+
+class AIDraftResponse(BaseModel):
+    agent: str
+    requires_approval: bool
+    draft: str
+    action: str
+    tone: str
+    confidence: float
+    rationale: str
+    risks: list[str]
+    model: str
+    used_fallback: bool
+
+
+@router.post("/batches/{batch_no}/ai-draft", response_model=AIDraftResponse)
+async def create_ai_draft(
+    batch_no: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Create a reviewable draft; this endpoint never sends email or changes intake state."""
+    batch = _get_batch(db, current_user, batch_no)
+    attachments = (
+        db.query(EmailBatchAttachment)
+        .filter(EmailBatchAttachment.parent_batch_id == batch.id)
+        .order_by(EmailBatchAttachment.id.asc())
+        .all()
+    )
+    result = await draft_reply(batch, attachments)
+    return AIDraftResponse(
+        agent="email_reply_drafter_v1",
+        requires_approval=True,
+        draft=result.draft,
+        action=result.action,
+        tone=result.tone,
+        confidence=result.confidence,
+        rationale=result.rationale,
+        risks=result.risks,
+        model=result.model,
+        used_fallback=result.used_fallback,
+    )
 
 
 async def _pdf_response(stored_path: str | None, filename: str, archived: bool = False) -> Response:
@@ -290,8 +359,11 @@ def _template_out(key: str, row: EmailTemplate | None, fallback: EmailTemplate |
     }
 
 
-def _check_mailbox(db: Session, integration_id: int | None) -> None:
-    if integration_id is not None and not db.query(EmailIntegration.id).filter(EmailIntegration.id == integration_id).first():
+def _check_mailbox(db: Session, integration_id: int | None, current_user: User | None = None) -> None:
+    if integration_id is None:
+        return
+    mailbox = db.query(EmailIntegration).filter(EmailIntegration.id == integration_id).first()
+    if not mailbox or (current_user is not None and not owns(current_user, mailbox)):
         raise HTTPException(status_code=404, detail="Mailbox not found")
 
 
@@ -316,7 +388,7 @@ def list_templates(
     db: Session = Depends(get_db), current_user: User = Depends(get_current_user),
 ):
     """Global templates, or the effective templates of one mailbox (override if any, else global)."""
-    _check_mailbox(db, integration_id)
+    _check_mailbox(db, integration_id, current_user)
     return [
         _template_out(key, _template_row(db, key, integration_id),
                       _template_row(db, key, None) if integration_id is not None else None, integration_id)

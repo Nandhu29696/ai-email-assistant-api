@@ -183,8 +183,9 @@ def test_twenty_emails_each_follow_their_rule(processed):
                  db.query(EmailBatchAttachment).filter_by(parent_batch_id=batch.id)}
         if sc.status not in ("IGNORED",) and sc.outcome != "SENDER_NOT_VERIFIED" and sc.file_status and files != sc.file_status:
             problems.append(f"files {files} != {sc.file_status}")
-        if not batch.email_category or not batch.sentiment:
-            problems.append("missing AI category/sentiment")
+        analysed = bool(batch.email_category and batch.sentiment)
+        if analysed != (sc.status == "SUCCESS"):
+            problems.append("AI analysis should exist only for successful emails")
         if problems:
             failures.append(f"{sc.name}: " + "; ".join(problems))
     assert not failures, "\n".join(failures)
@@ -232,20 +233,20 @@ def test_dashboard_and_day_filters_follow_received_dates(processed):
     db.add(admin)
     db.commit()
 
-    data = summary(days=30, db=db, current_user=admin)
+    data = summary(days=30, months=None, integration_id=None, db=db, current_user=admin)
     assert data["total"] == 20
     assert data["by_status"] == {"SUCCESS": 6, "REJECTED": 13, "IGNORED": 1}
     expected_outcomes = Counter(sc.outcome for sc, *_ in results)
     assert {k: v for k, v in data["by_outcome"].items() if v} == dict(expected_outcomes)
-    per_day = {row["date"]: row["SUCCESS"] + row["REJECTED"] + row["FAILED"] + row["OTHER"] for row in data["daily"]}
+    per_day = {row["date"]: row["SUCCESS"] + row["REJECTED"] + row["FAILED"] + row["IGNORED"] + row["IN_PROGRESS"] + row["OTHER"] for row in data["daily"]}
     expected_days = Counter(received_at(sc.days_ago, i).date().isoformat() for i, (sc, *_rest) in enumerate(results))
     assert per_day == dict(expected_days)
     assert len(per_day) == 14          # 20 emails over 14 distinct days (13 days ago .. today)
 
-    last_week = list_batches(db=db, current_user=admin, status=None, outcome=None, category=None, sentiment=None, priority=None,
+    last_week = list_batches(db=db, current_user=admin, status=None, outcome=None, category=None, sentiment=None, priority=None, integration_id=None, mailbox_type=None,
                              search=None, days=7, page=1, page_size=100)
     cutoff = datetime.now(timezone.utc) - timedelta(days=7)
     assert last_week["total"] == sum(1 for i, (sc, *_rest) in enumerate(results) if received_at(sc.days_ago, i) >= cutoff)
-    failed_rule = list_batches(db=db, current_user=admin, status=None, outcome="INVALID_ATTACHMENTS", category=None, priority=None,
+    failed_rule = list_batches(db=db, current_user=admin, status=None, outcome="INVALID_ATTACHMENTS", category=None, priority=None, integration_id=None, mailbox_type=None,
                                sentiment=None, search=None, days=30, page=1, page_size=100)
     assert failed_rule["total"] == 5

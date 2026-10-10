@@ -17,6 +17,9 @@ class IntegrationOut(BaseModel):
     max_file_size_mb: Optional[int] = None
     allowed_sender_domains: Optional[str] = None
     retention_days: Optional[int] = None
+    fetch_interval_seconds: Optional[int] = None   # own setting; None = global default
+    pickup_interval_seconds: Optional[int] = None  # the interval actually used
+    default_pickup_interval_seconds: Optional[int] = None
     process_since: Optional[datetime] = None
     last_sync_at: Optional[datetime] = None
     last_email_processed_at: Optional[datetime] = None

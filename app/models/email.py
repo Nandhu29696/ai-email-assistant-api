@@ -11,6 +11,17 @@ from sqlalchemy.sql import func
 from app.database import Base, UTCDateTime
 
 
+MIN_FETCH_INTERVAL_SECONDS = 15
+MAX_FETCH_INTERVAL_SECONDS = 3600
+
+
+def effective_fetch_interval(seconds: int | None) -> int:
+    """The mailbox's own pickup interval, or the global default, kept within the allowed range."""
+    from app.config import settings
+    value = seconds or settings.FETCH_INTERVAL_SECONDS
+    return max(MIN_FETCH_INTERVAL_SECONDS, min(MAX_FETCH_INTERVAL_SECONDS, int(value)))
+
+
 class EmailIntegration(Base):
     """A connected mailbox. Every new email in it runs through the intake rules."""
     __tablename__ = "email_integrations"
@@ -29,6 +40,15 @@ class EmailIntegration(Base):
     health_status = Column(String(20), default="unknown")  # healthy | degraded | error | unknown
     health_message = Column(Text)
 
+    @property
+    def pickup_interval_seconds(self) -> int:
+        """Seconds between checks for new email (own setting or the global default)."""
+        return effective_fetch_interval(self.fetch_interval_seconds)
+
+    @property
+    def default_pickup_interval_seconds(self) -> int:
+        return effective_fetch_interval(None)
+
     # Only emails received at or after this moment are processed, so connecting
     # (or re-connecting) a mailbox never auto-replies to its old backlog.
     process_since = Column(UTCDateTime())
@@ -42,6 +62,8 @@ class EmailIntegration(Base):
     success_folder_label = Column(String(100), default="Processed/Success")
     failed_folder_label  = Column(String(100), default="Processed/Failed")
     retention_days       = Column(Integer, default=90)   # stored PDFs are deleted after this many days
+    # How often to check this mailbox for new email, in seconds; empty = FETCH_INTERVAL_SECONDS.
+    fetch_interval_seconds = Column(Integer)
 
     # ── Provider sync state ──
     outlook_subscription_id         = Column(String(255))

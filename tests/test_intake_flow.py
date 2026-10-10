@@ -148,15 +148,31 @@ def file_statuses(db, batch):
     return {r.batch_source_filename: r.status for r in rows}
 
 
-# ── Rule 0: every email is categorised and analysed ───────────
-def test_every_email_gets_category_and_sentiment(env):
+# ── AI analysis: only for emails that pass every rule ─────────
+def test_successful_emails_are_analysed(env):
     db, mailbox, _ = env
-    service = FakeMailbox()
-    _, batch = run(db, mailbox, service, sender="x@unknown.org",
-                   body="This is unacceptable, I was charged twice and want a refund now!")
-    assert batch.email_category and batch.sentiment == "negative" and batch.primary_emotion
+    service = FakeMailbox([att("invoice.pdf", make_pdf())])
+    status, batch = run(db, mailbox, service, body="This is unacceptable, I was charged twice and want a refund now!")
+    assert status == "SUCCESS"
+    assert batch.email_category and batch.sentiment == "negative" and batch.primary_emotion and batch.priority
     events = [e.event_type for e in db.query(EmailBatchEvent).filter(EmailBatchEvent.parent_batch_id == batch.id)]
-    assert events[:2] == ["RECEIVED", "ANALYZED"]
+    assert "ANALYZED" in events and events.index("ANALYZED") < events.index("ATTACHMENTS_CONVERTED")
+
+
+@pytest.mark.parametrize("sender,headers,status", [
+    ("x@unknown.org", {}, "REJECTED"),                                   # domain not valid
+    ("alice@client.com", {}, "REJECTED"),                                # no attachment
+    ("alice@client.com", {"Auto-Submitted": "auto-replied"}, "IGNORED"),  # automated message
+])
+def test_ignored_and_rejected_emails_are_not_analysed(env, sender, headers, status):
+    db, mailbox, _ = env
+    result, batch = run(db, mailbox, FakeMailbox(), sender=sender, headers=headers,
+                        body="This is unacceptable, I was charged twice and want a refund now!")
+    assert result == status
+    assert (batch.email_category, batch.sentiment, batch.sentiment_score, batch.primary_emotion,
+            batch.priority, batch.ai_summary) == (None, None, None, None, None, None)
+    events = [e.event_type for e in db.query(EmailBatchEvent).filter(EmailBatchEvent.parent_batch_id == batch.id)]
+    assert "ANALYZED" not in events
 
 
 # ── Rule 1: invalid domain ────────────────────────────────────
@@ -431,3 +447,14 @@ def test_attachment_checks(name, factory, expected):
 
 def test_encrypted_docx_is_protected(tmp_path):
     assert check_attachment("locked.docx", make_encrypted_docx(tmp_path)).status == "PROTECTED"
+
+
+def test_replies_store_what_the_sender_received(env):
+    db, mailbox, _ = env
+    status, batch = run(db, mailbox, FakeMailbox([att("invoice.pdf", make_pdf())]))
+    assert status == "SUCCESS"
+    replies = [e for e in db.query(EmailBatchEvent).filter(EmailBatchEvent.parent_batch_id == batch.id) if e.reply_sent]
+    assert {e.event_type for e in replies} >= {"ACKNOWLEDGEMENT_SENT", "SUCCESS_REPLY"}
+    for event in replies:
+        assert event.details["reply_to"] == batch.sender_email
+        assert event.details["reply_subject"] and "<" in event.details["reply_html"]
